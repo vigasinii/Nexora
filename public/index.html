@@ -1,0 +1,51 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Nexora</title>
+<link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <div class="app">
+    <aside class="sidebar">
+      <div class="brand">
+        <div class="brand-mark">NX</div>
+        <div class="brand-text">
+          <div class="brand-title">Nexora</div>
+          <div class="brand-sub">2.2</div>
+        </div>
+      </div>
+      <nav id="nav"></nav>
+    </aside>
+    <main class="main">
+      <header class="topbar">
+        <h1 id="entity-title">Welcome</h1>
+        <button id="add-btn" class="btn btn-primary" style="display:none">+ New</button>
+      </header>
+      <section id="content" class="content">
+        <div class="welcome">
+          <h2>Welcome to Nexora</h2>
+          <p>Select a section from the left to view and manage records.</p>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <div id="modal-backdrop" class="modal-backdrop hidden">
+    <div class="modal">
+      <div class="modal-header">
+        <h3 id="modal-title">Edit Record</h3>
+        <button id="modal-close" class="icon-btn">&times;</button>
+      </div>
+      <form id="modal-form" class="modal-body"></form>
+      <div class="modal-footer">
+        <button id="modal-cancel" class="btn btn-ghost">Cancel</button>
+        <button id="modal-save" class="btn btn-primary">Save</button>
+      </div>
+    </div>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>
