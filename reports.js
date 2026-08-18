@@ -1,6 +1,8 @@
 // Print-friendly HTML report generation
 // Mirrors the report/printout features of the original Access application
 
+const { dbGet, dbAll, dbRun, dbExec } = require('./db-turso');
+
 function escapeHtml(s) {
   if (s === null || s === undefined) return '';
   return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
@@ -188,17 +190,17 @@ function page(title, bodyHtml) {
 <body>${toolbar()}${bodyHtml}</body></html>`;
 }
 
-function registerReportRoutes(app, db) {
+function registerReportRoutes(app) {
 
   // Sequential document numbers (INT2600182 style: prefix + 2-digit year +
   // zero-padded sequence). Shared logic with server.js's generic counter.
-  function getNextDocNumber(prefix, { includeYear = true, digits = 5 } = {}) {
-    const row = db.prepare(`SELECT next_number FROM T29_DocCounters WHERE doc_type = ?`).get(prefix);
+  async function getNextDocNumber(prefix, { includeYear = true, digits = 5 } = {}) {
+    const row = (await dbGet(`SELECT next_number FROM T29_DocCounters WHERE doc_type = ?`, [prefix]));
     const next = row ? row.next_number : 1;
     if (row) {
-      db.prepare(`UPDATE T29_DocCounters SET next_number = ? WHERE doc_type = ?`).run(next + 1, prefix);
+      (await dbRun(`UPDATE T29_DocCounters SET next_number = ? WHERE doc_type = ?`, [next + 1, prefix]));
     } else {
-      db.prepare(`INSERT INTO T29_DocCounters (doc_type, next_number) VALUES (?, ?)`).run(prefix, next + 1);
+      (await dbRun(`INSERT INTO T29_DocCounters (doc_type, next_number) VALUES (?, ?)`, [prefix, next + 1]));
     }
     const yearPart = includeYear ? String(new Date().getFullYear()).slice(-2) : '';
     const seqPart = digits > 0 ? String(next).padStart(digits, '0') : String(next);
@@ -208,16 +210,14 @@ function registerReportRoutes(app, db) {
   // Commercial Invoice and Packing List share one document number per
   // shipment (matches real-world usage — same number appears on both).
   // Generated once on first request, then reused every time after.
-  function getOrCreateShipmentDocNumber(soPk) {
-    let ful = db.prepare(`SELECT * FROM "T25_SO_Fulfillment" WHERE "T14_SO_PK" = ?`).get(soPk);
+  async function getOrCreateShipmentDocNumber(soPk) {
+    let ful = (await dbGet(`SELECT * FROM "T25_SO_Fulfillment" WHERE "T14_SO_PK" = ?`, [soPk]));
     if (ful && ful.T25_30_CI_Number) return ful.T25_30_CI_Number;
-    const docNumber = getNextDocNumber('INT');
+    const docNumber = await getNextDocNumber('INT');
     if (ful) {
-      db.prepare(`UPDATE "T25_SO_Fulfillment" SET "T25_30_CI_Number" = ?, "T25_31_PL_Number" = ? WHERE "T14_SO_PK" = ?`)
-        .run(docNumber, docNumber, soPk);
+      (await dbRun(`UPDATE "T25_SO_Fulfillment" SET "T25_30_CI_Number" = ?, "T25_31_PL_Number" = ? WHERE "T14_SO_PK" = ?`, [docNumber, docNumber, soPk]));
     } else {
-      db.prepare(`INSERT INTO "T25_SO_Fulfillment" ("T14_SO_PK", "T25_30_CI_Number", "T25_31_PL_Number") VALUES (?, ?, ?)`)
-        .run(soPk, docNumber, docNumber);
+      (await dbRun(`INSERT INTO "T25_SO_Fulfillment" ("T14_SO_PK", "T25_30_CI_Number", "T25_31_PL_Number") VALUES (?, ?, ?)`, [soPk, docNumber, docNumber]));
     }
     return docNumber;
   }
@@ -226,21 +226,21 @@ function registerReportRoutes(app, db) {
   // exists, so its SRF number can be shown on logistics documents
   // (Commercial Invoice / Packing List / Delivery Note) alongside the
   // shipment's own Invoice/PL number.
-  function getSrfNumberForSO(soPk) {
-    const req_ = db.prepare(`
+  async function getSrfNumberForSO(soPk) {
+    const req_ = (await dbGet(`
       SELECT T27_09_SRF_Number FROM T27_Requisition
       WHERE T14_SO_PK = ? AND T27_06_Status = 'Approved' AND T27_09_SRF_Number IS NOT NULL
       ORDER BY T27_Requisition_ID DESC LIMIT 1
-    `).get(soPk);
+    `, [soPk]));
     return req_ ? req_.T27_09_SRF_Number : null;
   }
 
-  function getYourCompany() {
-    const yc = db.prepare(`SELECT * FROM "T04_Your_Company" LIMIT 1`).get();
+  async function getYourCompany() {
+    const yc = (await dbGet(`SELECT * FROM "T04_Your_Company" LIMIT 1`));
     if (!yc) return { name: 'Your Company', address: '', city: '', web: '', phone: '', fax: '' };
     let city = '';
     if (yc.T02_City_PK) {
-      const c = db.prepare(`SELECT * FROM "T02_CityStatePCode" WHERE "T02_City_PK" = ?`).get(yc.T02_City_PK);
+      const c = (await dbGet(`SELECT * FROM "T02_CityStatePCode" WHERE "T02_City_PK" = ?`, [yc.T02_City_PK]));
       if (c) city = [c.T02_1_City, c.T02_2_State, c.T02_3_PCode].filter(Boolean).join(', ');
     }
     return {
@@ -254,21 +254,21 @@ function registerReportRoutes(app, db) {
     };
   }
 
-  function letterheadHtml() {
-    const yc = getYourCompany();
+  async function letterheadHtml() {
+    const yc = await getYourCompany();
     const detailsParts = [yc.address, yc.city, yc.phone ? `Tel: ${yc.phone}` : '', yc.fax ? `Fax: ${yc.fax}` : '', yc.web]
       .filter(Boolean).map(escapeHtml).join(' &nbsp;|&nbsp; ');
     const logoHtml = yc.logo ? `<img src="/uploads/${escapeHtml(yc.logo)}" class="letterhead-logo" />` : '';
     return { yc, detailsParts, logoHtml };
   }
 
-  function getContact(pk) {
+  async function getContact(pk) {
     if (!pk) return null;
-    const c = db.prepare(`SELECT * FROM "T07_Contacts" WHERE "T07_PK" = ?`).get(pk);
+    const c = (await dbGet(`SELECT * FROM "T07_Contacts" WHERE "T07_PK" = ?`, [pk]));
     if (!c) return null;
     let companyName = '';
     if (c.T01_PK) {
-      const comp = db.prepare(`SELECT * FROM "T01_Company" WHERE "T01_PK" = ?`).get(c.T01_PK);
+      const comp = (await dbGet(`SELECT * FROM "T01_Company" WHERE "T01_PK" = ?`, [c.T01_PK]));
       if (comp) companyName = comp.T01_01_Company_Name || '';
     }
     return {
@@ -279,42 +279,42 @@ function registerReportRoutes(app, db) {
     };
   }
 
-  function getEmployee(pk) {
+  async function getEmployee(pk) {
     if (!pk) return null;
-    const e = db.prepare(`SELECT * FROM "T05_Employees" WHERE "T05_Employee_PK" = ?`).get(pk);
+    const e = (await dbGet(`SELECT * FROM "T05_Employees" WHERE "T05_Employee_PK" = ?`, [pk]));
     if (!e) return null;
     return { name: [e.T05_01_Forename, e.T05_02_Surname].filter(Boolean).join(' ') };
   }
 
-  function getCurrency(id) {
+  async function getCurrency(id) {
     if (!id) return null;
-    return db.prepare(`SELECT * FROM "T22_Currency" WHERE "T22_Currency_ID" = ?`).get(id);
+    return (await dbGet(`SELECT * FROM "T22_Currency" WHERE "T22_Currency_ID" = ?`, [id]));
   }
 
-  function getCourier(pk) {
+  async function getCourier(pk) {
     if (!pk) return null;
-    return db.prepare(`SELECT * FROM "T13_Courier" WHERE "T13_PK" = ?`).get(pk);
+    return (await dbGet(`SELECT * FROM "T13_Courier" WHERE "T13_PK" = ?`, [pk]));
   }
 
   // ---------- Sales Order / Invoice ----------
-  app.get('/reports/sales-order/:id', (req, res) => {
-    const so = db.prepare(`SELECT * FROM "T14_Sales_Orders" WHERE "T14_SO_PK" = ?`).get(req.params.id);
+  app.get('/reports/sales-order/:id', async (req, res) => {
+    const so = (await dbGet(`SELECT * FROM "T14_Sales_Orders" WHERE "T14_SO_PK" = ?`, [req.params.id]));
     if (!so) return res.status(404).send(page('Not Found', '<p class="empty-notice">Sales order not found.</p>'));
 
-    const { yc, detailsParts, logoHtml } = letterheadHtml();
-    const contact = getContact(so.T07_PK);
-    const shipTo = getContact(so.T07_PK_SHIPTO);
-    const employee = getEmployee(so.T05_Employee_PK);
-    const currency = getCurrency(so.T22_Currency_ID);
-    const courier = getCourier(so.T13_PK);
+    const { yc, detailsParts, logoHtml } = await letterheadHtml();
+    const contact = await getContact(so.T07_PK);
+    const shipTo = await getContact(so.T07_PK_SHIPTO);
+    const employee = await getEmployee(so.T05_Employee_PK);
+    const currency = await getCurrency(so.T22_Currency_ID);
+    const courier = await getCourier(so.T13_PK);
     const symbol = currency?.T22_02_Symbol || '';
 
-    const lines = db.prepare(`
+    const lines = (await dbAll(`
       SELECT d.*, i."T11_03_Short_Description" as item_desc, i."T11_04_Long_Description" as item_long
       FROM "T15_SO_Details" d
       LEFT JOIN "T11_Item_Master" i ON i."T11_Item_Master_PK" = d."T11_Item_Master_PK"
       WHERE d."T14_SO_PK" = ?
-    `).all(so.T14_SO_PK);
+    `, [so.T14_SO_PK]));
 
     let subtotal = 0;
     const convRate = Number(so.T14_15_Conversion_Rate) || 1;
@@ -386,24 +386,24 @@ function registerReportRoutes(app, db) {
   });
 
   // ---------- Commercial Invoice (export document, used for customs/shipping) ----------
-  app.get('/reports/commercial-invoice/:id', (req, res) => {
-    const so = db.prepare(`SELECT * FROM "T14_Sales_Orders" WHERE "T14_SO_PK" = ?`).get(req.params.id);
+  app.get('/reports/commercial-invoice/:id', async (req, res) => {
+    const so = (await dbGet(`SELECT * FROM "T14_Sales_Orders" WHERE "T14_SO_PK" = ?`, [req.params.id]));
     if (!so) return res.status(404).send(page('Not Found', '<p class="empty-notice">Sales order not found.</p>'));
 
-    const { yc, detailsParts, logoHtml } = letterheadHtml();
-    const contact = getContact(so.T07_PK);
-    const shipTo = getContact(so.T07_PK_SHIPTO);
-    const currency = getCurrency(so.T22_Currency_ID);
+    const { yc, detailsParts, logoHtml } = await letterheadHtml();
+    const contact = await getContact(so.T07_PK);
+    const shipTo = await getContact(so.T07_PK_SHIPTO);
+    const currency = await getCurrency(so.T22_Currency_ID);
     const symbol = currency?.T22_02_Symbol || '';
-    const ful = db.prepare(`SELECT * FROM "T25_SO_Fulfillment" WHERE "T14_SO_PK" = ?`).get(so.T14_SO_PK) || {};
-    const shipmentDocNumber = getOrCreateShipmentDocNumber(so.T14_SO_PK);
-    const srfNumber = getSrfNumberForSO(so.T14_SO_PK);
+    const ful = (await dbGet(`SELECT * FROM "T25_SO_Fulfillment" WHERE "T14_SO_PK" = ?`, [so.T14_SO_PK])) || {};
+    const shipmentDocNumber = await getOrCreateShipmentDocNumber(so.T14_SO_PK);
+    const srfNumber = await getSrfNumberForSO(so.T14_SO_PK);
 
-    const lines = db.prepare(`
+    const lines = (await dbAll(`
       SELECT d.*, i."T11_01_Part_Number" as part_number, i."T11_03_Short_Description" as item_desc, i."T11_04_Long_Description" as item_long
       FROM "T15_SO_Details" d LEFT JOIN "T11_Item_Master" i ON i."T11_Item_Master_PK" = d."T11_Item_Master_PK"
       WHERE d."T14_SO_PK" = ?
-    `).all(so.T14_SO_PK);
+    `, [so.T14_SO_PK]));
 
     let subtotal = 0;
     const convRate = Number(so.T14_15_Conversion_Rate) || 1;
@@ -475,16 +475,16 @@ function registerReportRoutes(app, db) {
   // ---------- Packing List for a Sales Order shipment (shares the same
   // document number as the Commercial Invoice, matching real-world usage) ----------
   // ---------- RMA (Return Merchandise Authorization) ----------
-  app.get('/reports/rma/:id', (req, res) => {
-    const rma = db.prepare(`SELECT * FROM T30_RMA WHERE T30_RMA_PK = ?`).get(req.params.id);
+  app.get('/reports/rma/:id', async (req, res) => {
+    const rma = (await dbGet(`SELECT * FROM T30_RMA WHERE T30_RMA_PK = ?`, [req.params.id]));
     if (!rma) return res.status(404).send(page('Not Found', '<p class="empty-notice">RMA not found.</p>'));
 
-    const so = db.prepare(`SELECT * FROM "T14_Sales_Orders" WHERE "T14_SO_PK" = ?`).get(rma.T14_SO_PK);
-    const item = db.prepare(`SELECT * FROM "T11_Item_Master" WHERE "T11_Item_Master_PK" = ?`).get(rma.T11_Item_Master_PK);
-    const serial = rma.T24_Serial_PK ? db.prepare(`SELECT * FROM "T24_Serial_Numbers" WHERE "T24_Serial_PK" = ?`).get(rma.T24_Serial_PK) : null;
-    const contact = getContact(so?.T07_PK);
-    const { yc, detailsParts, logoHtml } = letterheadHtml();
-    const shipmentDocNumber = so ? getOrCreateShipmentDocNumber(so.T14_SO_PK) : null;
+    const so = (await dbGet(`SELECT * FROM "T14_Sales_Orders" WHERE "T14_SO_PK" = ?`, [rma.T14_SO_PK]));
+    const item = (await dbGet(`SELECT * FROM "T11_Item_Master" WHERE "T11_Item_Master_PK" = ?`, [rma.T11_Item_Master_PK]));
+    const serial = rma.T24_Serial_PK ? (await dbGet(`SELECT * FROM "T24_Serial_Numbers" WHERE "T24_Serial_PK" = ?`, [rma.T24_Serial_PK])) : null;
+    const contact = await getContact(so?.T07_PK);
+    const { yc, detailsParts, logoHtml } = await letterheadHtml();
+    const shipmentDocNumber = so ? await getOrCreateShipmentDocNumber(so.T14_SO_PK) : null;
 
     const warrantyBadge = rma.T30_04_Under_Warranty === 1
       ? '<span style="color:#15803d;font-weight:700">UNDER WARRANTY</span>'
@@ -533,22 +533,22 @@ function registerReportRoutes(app, db) {
     res.send(page(`RMA ${rma.T30_01_RMA_Number}`, body));
   });
 
-  app.get('/reports/packing-list-so/:id', (req, res) => {
-    const so = db.prepare(`SELECT * FROM "T14_Sales_Orders" WHERE "T14_SO_PK" = ?`).get(req.params.id);
+  app.get('/reports/packing-list-so/:id', async (req, res) => {
+    const so = (await dbGet(`SELECT * FROM "T14_Sales_Orders" WHERE "T14_SO_PK" = ?`, [req.params.id]));
     if (!so) return res.status(404).send(page('Not Found', '<p class="empty-notice">Sales order not found.</p>'));
 
-    const { yc, detailsParts, logoHtml } = letterheadHtml();
-    const contact = getContact(so.T07_PK);
-    const shipTo = getContact(so.T07_PK_SHIPTO);
-    const ful = db.prepare(`SELECT * FROM "T25_SO_Fulfillment" WHERE "T14_SO_PK" = ?`).get(so.T14_SO_PK) || {};
-    const shipmentDocNumber = getOrCreateShipmentDocNumber(so.T14_SO_PK);
-    const srfNumber = getSrfNumberForSO(so.T14_SO_PK);
+    const { yc, detailsParts, logoHtml } = await letterheadHtml();
+    const contact = await getContact(so.T07_PK);
+    const shipTo = await getContact(so.T07_PK_SHIPTO);
+    const ful = (await dbGet(`SELECT * FROM "T25_SO_Fulfillment" WHERE "T14_SO_PK" = ?`, [so.T14_SO_PK])) || {};
+    const shipmentDocNumber = await getOrCreateShipmentDocNumber(so.T14_SO_PK);
+    const srfNumber = await getSrfNumberForSO(so.T14_SO_PK);
 
-    const lines = db.prepare(`
+    const lines = (await dbAll(`
       SELECT d.*, i."T11_01_Part_Number" as part_number, i."T11_03_Short_Description" as item_desc, i."T11_04_Long_Description" as item_long
       FROM "T15_SO_Details" d LEFT JOIN "T11_Item_Master" i ON i."T11_Item_Master_PK" = d."T11_Item_Master_PK"
       WHERE d."T14_SO_PK" = ?
-    `).all(so.T14_SO_PK);
+    `, [so.T14_SO_PK]));
 
     const rowsHtml = lines.map(l => `<tr>
       <td>${escapeHtml(l.part_number ?? '')}</td>
@@ -592,23 +592,23 @@ function registerReportRoutes(app, db) {
     res.send(page(`Packing List ${shipmentDocNumber}`, body));
   });
 
-  app.get('/reports/packing-list/:id', (req, res) => {
-    const req_ = db.prepare(`SELECT * FROM "T27_Requisition" WHERE "T27_Requisition_ID" = ?`).get(req.params.id);
+  app.get('/reports/packing-list/:id', async (req, res) => {
+    const req_ = (await dbGet(`SELECT * FROM "T27_Requisition" WHERE "T27_Requisition_ID" = ?`, [req.params.id]));
     if (!req_) return res.status(404).send(page('Not Found', '<p class="empty-notice">Requisition not found.</p>'));
 
-    const { yc, detailsParts, logoHtml } = letterheadHtml();
+    const { yc, detailsParts, logoHtml } = await letterheadHtml();
     let ful = {};
     let soNumber = null;
     let soLines = [];
     if (req_.T14_SO_PK) {
-      ful = db.prepare(`SELECT * FROM "T25_SO_Fulfillment" WHERE "T14_SO_PK" = ?`).get(req_.T14_SO_PK) || {};
-      const so = db.prepare(`SELECT "T14_01_SO_Number" FROM "T14_Sales_Orders" WHERE "T14_SO_PK" = ?`).get(req_.T14_SO_PK);
+      ful = (await dbGet(`SELECT * FROM "T25_SO_Fulfillment" WHERE "T14_SO_PK" = ?`, [req_.T14_SO_PK])) || {};
+      const so = (await dbGet(`SELECT "T14_01_SO_Number" FROM "T14_Sales_Orders" WHERE "T14_SO_PK" = ?`, [req_.T14_SO_PK]));
       soNumber = so?.T14_01_SO_Number;
-      soLines = db.prepare(`
+      soLines = (await dbAll(`
         SELECT d.*, i."T11_01_Part_Number" as partNumber, i."T11_03_Short_Description" as itemName
         FROM "T15_SO_Details" d LEFT JOIN "T11_Item_Master" i ON i."T11_Item_Master_PK" = d."T11_Item_Master_PK"
         WHERE d."T14_SO_PK" = ?
-      `).all(req_.T14_SO_PK);
+      `, [req_.T14_SO_PK]));
     }
 
     const rowsHtml = soLines.map(l => `<tr>
@@ -649,27 +649,27 @@ function registerReportRoutes(app, db) {
     res.send(page(`Stock Requisition ${req_.T27_09_SRF_Number || req_.T27_Requisition_ID}`, body));
   });
 
-  app.get('/reports/delivery-note/:id', (req, res) => {
-    const so = db.prepare(`SELECT * FROM "T14_Sales_Orders" WHERE "T14_SO_PK" = ?`).get(req.params.id);
+  app.get('/reports/delivery-note/:id', async (req, res) => {
+    const so = (await dbGet(`SELECT * FROM "T14_Sales_Orders" WHERE "T14_SO_PK" = ?`, [req.params.id]));
     if (!so) return res.status(404).send(page('Not Found', '<p class="empty-notice">Sales order not found.</p>'));
 
-    const { yc, detailsParts, logoHtml } = letterheadHtml();
-    const contact = getContact(so.T07_PK);
-    const shipTo = getContact(so.T07_PK_SHIPTO);
-    const courier = getCourier(so.T13_PK);
-    const ful = db.prepare(`SELECT * FROM "T25_SO_Fulfillment" WHERE "T14_SO_PK" = ?`).get(so.T14_SO_PK) || {};
-    const srfNumber = getSrfNumberForSO(so.T14_SO_PK);
+    const { yc, detailsParts, logoHtml } = await letterheadHtml();
+    const contact = await getContact(so.T07_PK);
+    const shipTo = await getContact(so.T07_PK_SHIPTO);
+    const courier = await getCourier(so.T13_PK);
+    const ful = (await dbGet(`SELECT * FROM "T25_SO_Fulfillment" WHERE "T14_SO_PK" = ?`, [so.T14_SO_PK])) || {};
+    const srfNumber = await getSrfNumberForSO(so.T14_SO_PK);
 
-    const lines = db.prepare(`
+    const lines = (await dbAll(`
       SELECT d.*, i."T11_01_Part_Number" as part_number, i."T11_03_Short_Description" as item_desc, i."T11_04_Long_Description" as item_long
       FROM "T15_SO_Details" d LEFT JOIN "T11_Item_Master" i ON i."T11_Item_Master_PK" = d."T11_Item_Master_PK"
       WHERE d."T14_SO_PK" = ?
-    `).all(so.T14_SO_PK);
+    `, [so.T14_SO_PK]));
 
     // Serial numbers assigned to this specific sales order, grouped by item
-    const serials = db.prepare(`
+    const serials = (await dbAll(`
       SELECT * FROM "T24_Serial_Numbers" WHERE "T14_SO_PK" = ?
-    `).all(so.T14_SO_PK);
+    `, [so.T14_SO_PK]));
     const serialsByItem = {};
     serials.forEach(s => {
       if (!serialsByItem[s.T11_Item_Master_PK]) serialsByItem[s.T11_Item_Master_PK] = [];
@@ -737,21 +737,21 @@ function registerReportRoutes(app, db) {
   });
 
   // ---------- Purchase Order ----------
-  app.get('/reports/purchase-order/:id', (req, res) => {
-    const po = db.prepare(`SELECT * FROM "T17_Purchase_Orders" WHERE "T17_PO_PK" = ?`).get(req.params.id);
+  app.get('/reports/purchase-order/:id', async (req, res) => {
+    const po = (await dbGet(`SELECT * FROM "T17_Purchase_Orders" WHERE "T17_PO_PK" = ?`, [req.params.id]));
     if (!po) return res.status(404).send(page('Not Found', '<p class="empty-notice">Purchase order not found.</p>'));
 
-    const { yc, detailsParts, logoHtml } = letterheadHtml();
-    const supplier = getContact(po.T07_PK);
-    const employee = getEmployee(po.T05_Employee_PK);
-    const courier = getCourier(po.T13_PK);
+    const { yc, detailsParts, logoHtml } = await letterheadHtml();
+    const supplier = await getContact(po.T07_PK);
+    const employee = await getEmployee(po.T05_Employee_PK);
+    const courier = await getCourier(po.T13_PK);
 
-    const lines = db.prepare(`
+    const lines = (await dbAll(`
       SELECT d.*, i."T11_03_Short_Description" as item_desc, i."T11_04_Long_Description" as item_long
       FROM "T18_PO_Details" d
       LEFT JOIN "T11_Item_Master" i ON i."T11_Item_Master_PK" = d."T11_Item_Master_PK"
       WHERE d."T17_PO_PK" = ?
-    `).all(po.T17_PO_PK);
+    `, [po.T17_PO_PK]));
 
     let subtotal = 0;
     const rowsHtml = lines.map(l => {
@@ -810,19 +810,19 @@ function registerReportRoutes(app, db) {
   });
 
   // ---------- Quote (Simple) — totals only, no per-tier pricing ----------
-  app.get('/reports/quote-simple/:id', (req, res) => {
-    const so = db.prepare(`SELECT * FROM "T14_Sales_Orders" WHERE "T14_SO_PK" = ?`).get(req.params.id);
+  app.get('/reports/quote-simple/:id', async (req, res) => {
+    const so = (await dbGet(`SELECT * FROM "T14_Sales_Orders" WHERE "T14_SO_PK" = ?`, [req.params.id]));
     if (!so) return res.status(404).send(page('Not Found', '<p class="empty-notice">Sales order not found.</p>'));
-    const { yc, detailsParts, logoHtml } = letterheadHtml();
-    const contact = getContact(so.T07_PK);
-    const currency = getCurrency(so.T22_Currency_ID);
+    const { yc, detailsParts, logoHtml } = await letterheadHtml();
+    const contact = await getContact(so.T07_PK);
+    const currency = await getCurrency(so.T22_Currency_ID);
     const symbol = currency?.T22_02_Symbol || '';
     const convRate = Number(so.T14_15_Conversion_Rate) || 1;
-    const lines = db.prepare(`
+    const lines = (await dbAll(`
       SELECT d.*, i."T11_03_Short_Description" as item_desc
       FROM "T15_SO_Details" d LEFT JOIN "T11_Item_Master" i ON i."T11_Item_Master_PK" = d."T11_Item_Master_PK"
       WHERE d."T14_SO_PK" = ?
-    `).all(so.T14_SO_PK);
+    `, [so.T14_SO_PK]));
     let subtotal = 0;
     const rowsHtml = lines.map(l => {
       const qty = Number(l.T15_01_Quantity) || 0;
@@ -846,20 +846,20 @@ function registerReportRoutes(app, db) {
   });
 
   // ---------- Quote (Extended) — shows Retail / Trade / OEM price tiers ----------
-  app.get('/reports/quote-extended/:id', (req, res) => {
-    const so = db.prepare(`SELECT * FROM "T14_Sales_Orders" WHERE "T14_SO_PK" = ?`).get(req.params.id);
+  app.get('/reports/quote-extended/:id', async (req, res) => {
+    const so = (await dbGet(`SELECT * FROM "T14_Sales_Orders" WHERE "T14_SO_PK" = ?`, [req.params.id]));
     if (!so) return res.status(404).send(page('Not Found', '<p class="empty-notice">Sales order not found.</p>'));
-    const { yc, detailsParts, logoHtml } = letterheadHtml();
-    const contact = getContact(so.T07_PK);
-    const currency = getCurrency(so.T22_Currency_ID);
+    const { yc, detailsParts, logoHtml } = await letterheadHtml();
+    const contact = await getContact(so.T07_PK);
+    const currency = await getCurrency(so.T22_Currency_ID);
     const symbol = currency?.T22_02_Symbol || '';
     const convRate = Number(so.T14_15_Conversion_Rate) || 1;
-    const lines = db.prepare(`
+    const lines = (await dbAll(`
       SELECT d.*, i."T11_01_Part_Number" as part_number, i."T11_03_Short_Description" as item_desc,
              i."T11_09_List_Price" as retail, i."T11_10_Trade_Price" as trade, i."T11_11_OEM_Price" as oem
       FROM "T15_SO_Details" d LEFT JOIN "T11_Item_Master" i ON i."T11_Item_Master_PK" = d."T11_Item_Master_PK"
       WHERE d."T14_SO_PK" = ?
-    `).all(so.T14_SO_PK);
+    `, [so.T14_SO_PK]));
     let subtotal = 0;
     const rowsHtml = lines.map(l => {
       const qty = Number(l.T15_01_Quantity) || 0;
@@ -892,10 +892,10 @@ function registerReportRoutes(app, db) {
   });
 
   // ---------- Quotation ----------
-  app.get('/reports/quotation/:id', (req, res) => {
-    const q = db.prepare(`SELECT * FROM "T20_Quotations" WHERE "T20_Quotation_ID" = ?`).get(req.params.id);
+  app.get('/reports/quotation/:id', async (req, res) => {
+    const q = (await dbGet(`SELECT * FROM "T20_Quotations" WHERE "T20_Quotation_ID" = ?`, [req.params.id]));
     if (!q) return res.status(404).send(page('Not Found', '<p class="empty-notice">Quotation not found.</p>'));
-    const { yc, detailsParts, logoHtml } = letterheadHtml();
+    const { yc, detailsParts, logoHtml } = await letterheadHtml();
     const body = `
       <div class="letterhead">
         <div class="letterhead-brand">${logoHtml}<div>
@@ -916,17 +916,17 @@ function registerReportRoutes(app, db) {
   });
 
   // ---------- Item Catalog / Price List ----------
-  app.get('/reports/item-catalog', (req, res) => {
-    const items = db.prepare(`
+  app.get('/reports/item-catalog', async (req, res) => {
+    const items = (await dbAll(`
       SELECT i.*, c."T12_01_Category" as category_name
       FROM "T11_Item_Master" i
       LEFT JOIN "T12_Category" c ON c."T12_Category_PK" = i."T12_Category_PK"
       WHERE i."T11_12_Obsolete" = 0
         AND (COALESCE(i."T11_09_List_Price",0) <> 0 OR COALESCE(i."T11_10_Trade_Price",0) <> 0 OR COALESCE(i."T11_11_OEM_Price",0) <> 0)
       ORDER BY category_name, i."T11_01_Part_Number"
-    `).all();
+    `));
 
-    const { yc, detailsParts, logoHtml } = letterheadHtml();
+    const { yc, detailsParts, logoHtml } = await letterheadHtml();
 
     if (!items.length) {
       return res.send(page('Item Catalog', `
@@ -974,9 +974,9 @@ function registerReportRoutes(app, db) {
   });
 
   // ---------- Company / Contact Directory ----------
-  app.get('/reports/directory', (req, res) => {
-    const companies = db.prepare(`SELECT * FROM "T01_Company" ORDER BY "T01_01_Company_Name"`).all();
-    const { yc, detailsParts, logoHtml } = letterheadHtml();
+  app.get('/reports/directory', async (req, res) => {
+    const companies = (await dbAll(`SELECT * FROM "T01_Company" ORDER BY "T01_01_Company_Name"`));
+    const { yc, detailsParts, logoHtml } = await letterheadHtml();
 
     if (!companies.length) {
       return res.send(page('Company Directory', `
@@ -989,11 +989,11 @@ function registerReportRoutes(app, db) {
     }
 
     let rows = '';
-    companies.forEach(comp => {
-      const contacts = db.prepare(`SELECT * FROM "T07_Contacts" WHERE "T01_PK" = ?`).all(comp.T01_PK);
+    for (const comp of companies) {
+      const contacts = (await dbAll(`SELECT * FROM "T07_Contacts" WHERE "T01_PK" = ?`, [comp.T01_PK]));
       let city = '';
       if (comp.T02_City_PK) {
-        const c = db.prepare(`SELECT * FROM "T02_CityStatePCode" WHERE "T02_City_PK" = ?`).get(comp.T02_City_PK);
+        const c = (await dbGet(`SELECT * FROM "T02_CityStatePCode" WHERE "T02_City_PK" = ?`, [comp.T02_City_PK]));
         if (c) city = [c.T02_1_City, c.T02_2_State].filter(Boolean).join(', ');
       }
       rows += `<tr><td colspan="3" style="font-family:'Inter',sans-serif;font-weight:700;font-size:13px;padding-top:18px;border-bottom:2px solid #1a1a1a;">
@@ -1010,7 +1010,7 @@ function registerReportRoutes(app, db) {
           </tr>`;
         });
       }
-    });
+    }
 
     const body = `
       <div class="letterhead">
