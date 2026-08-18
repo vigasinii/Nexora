@@ -8,40 +8,15 @@ const multer = require('multer');
 const bcrypt = require('bcryptjs');
 const session = require('express-session');
 const { WebSocketServer } = require('ws');
-const { DatabaseSync } = require('node:sqlite');
+const { dbGet, dbAll, dbRun, dbExec } = require('./db-turso');
 const { ENTITIES, NAV_GROUPS } = require('./schema');
 const { registerReportRoutes } = require('./reports');
 const { registerReports2 } = require('./reports2');
 
-const DB_PATH = process.env.DATAHOUSE_DB_PATH || path.join(__dirname, 'datahouse.db');
-
-// If DATAHOUSE_DB_PATH points somewhere that doesn't exist yet (e.g. a
-// freshly-mounted persistent disk on first deploy), seed it from the
-// bundled copy that ships with the app — same idea as the Electron app
-// copying its bundled db into place on first launch. Without this, a
-// brand-new empty SQLite file gets created with none of the real tables,
-// and the app looks like it's "working" while actually being empty.
-try {
-  if (!fs.existsSync(DB_PATH)) {
-    const bundledSeed = path.join(__dirname, 'datahouse.db');
-    const dbDir = path.dirname(DB_PATH);
-    if (!fs.existsSync(dbDir)) fs.mkdirSync(dbDir, { recursive: true });
-    if (fs.existsSync(bundledSeed) && path.resolve(bundledSeed) !== path.resolve(DB_PATH)) {
-      fs.copyFileSync(bundledSeed, DB_PATH);
-      console.log(`Seeded new database at ${DB_PATH} from bundled copy.`);
-    }
-  }
-} catch (e) {
-  console.error(`Could not seed database at ${DB_PATH}: ${e.message}`);
-}
-
-const db = new DatabaseSync(DB_PATH);
-runMigrations(db);
-
 // Additive-only migrations — safe to run on every startup. Lets existing
 // database files (e.g. an already-installed desktop app) gain new columns
 // without wiping the user's data.
-function runMigrations(db) {
+async function runMigrations() {
   const migrations = [
     { table: 'T11_Item_Master', column: 'T11_55_Photo', ddl: 'ALTER TABLE T11_Item_Master ADD COLUMN T11_55_Photo TEXT' },
     { table: 'T21_Projects', column: 'T21_02_Project_Code', ddl: 'ALTER TABLE T21_Projects ADD COLUMN T21_02_Project_Code TEXT' },
@@ -75,16 +50,16 @@ function runMigrations(db) {
   ];
   for (const m of migrations) {
     try {
-      const cols = db.prepare(`PRAGMA table_info("${m.table}")`).all();
+      const cols = (await dbAll(`PRAGMA table_info("${m.table}")`));
       const exists = cols.some(c => c.name === m.column);
-      if (!exists) db.exec(m.ddl);
+      if (!exists) (await dbExec(m.ddl));
     } catch (e) {
       console.error(`Migration failed for ${m.table}.${m.column}:`, e.message);
     }
   }
   // New tables (idempotent — CREATE TABLE IF NOT EXISTS is safe on every startup)
   try {
-    db.exec(`
+    (await dbExec(`
       CREATE TABLE IF NOT EXISTS T27_Requisition (
         T27_Requisition_ID INTEGER PRIMARY KEY AUTOINCREMENT,
         T27_01_Type TEXT,
@@ -98,12 +73,12 @@ function runMigrations(db) {
         T27_08_Notes TEXT,
         FOREIGN KEY (T11_Item_Master_PK) REFERENCES T11_Item_Master(T11_Item_Master_PK)
       );
-    `);
+    `));
   } catch (e) {
     console.error('Migration failed creating T27_Requisition:', e.message);
   }
   try {
-    db.exec(`
+    (await dbExec(`
       CREATE TABLE IF NOT EXISTS T26_Forecast (
         T26_Forecast_ID INTEGER PRIMARY KEY AUTOINCREMENT,
         T11_Item_Master_PK TEXT NOT NULL,
@@ -116,12 +91,12 @@ function runMigrations(db) {
         FOREIGN KEY (T11_Item_Master_PK) REFERENCES T11_Item_Master(T11_Item_Master_PK),
         FOREIGN KEY (T01_PK) REFERENCES T01_Company(T01_PK)
       );
-    `);
+    `));
   } catch (e) {
     console.error('Migration failed creating T26_Forecast:', e.message);
   }
   try {
-    db.exec(`
+    (await dbExec(`
       CREATE TABLE IF NOT EXISTS T28_Users (
         T28_User_PK TEXT PRIMARY KEY,
         T28_01_Name TEXT NOT NULL,
@@ -130,17 +105,17 @@ function runMigrations(db) {
         T28_04_Department TEXT NOT NULL,
         T28_05_Active INTEGER DEFAULT 1
       );
-    `);
+    `));
   } catch (e) {
     console.error('Migration failed creating T28_Users:', e.message);
   }
   try {
-    db.exec(`CREATE TABLE IF NOT EXISTS T29_DocCounters (doc_type TEXT PRIMARY KEY, next_number INTEGER NOT NULL DEFAULT 1);`);
+    (await dbExec(`CREATE TABLE IF NOT EXISTS T29_DocCounters (doc_type TEXT PRIMARY KEY, next_number INTEGER NOT NULL DEFAULT 1);`));
   } catch (e) {
     console.error('Migration failed creating T29_DocCounters:', e.message);
   }
   try {
-    db.exec(`
+    (await dbExec(`
       CREATE TABLE IF NOT EXISTS T30_RMA (
         T30_RMA_PK TEXT PRIMARY KEY,
         T30_01_RMA_Number TEXT UNIQUE,
@@ -156,7 +131,7 @@ function runMigrations(db) {
         FOREIGN KEY (T14_SO_PK) REFERENCES T14_Sales_Orders(T14_SO_PK),
         FOREIGN KEY (T11_Item_Master_PK) REFERENCES T11_Item_Master(T11_Item_Master_PK)
       );
-    `);
+    `));
   } catch (e) {
     console.error('Migration failed creating T30_RMA:', e.message);
   }
@@ -166,10 +141,10 @@ function runMigrations(db) {
   // lists all of its items instead, so that old constraint has to go —
   // SQLite can't relax a NOT NULL in place, so this rebuilds the table.
   try {
-    const tableInfo = db.prepare(`PRAGMA table_info("T27_Requisition")`).all();
+    const tableInfo = (await dbAll(`PRAGMA table_info("T27_Requisition")`));
     const itemCol = tableInfo.find(c => c.name === 'T11_Item_Master_PK');
     if (itemCol && itemCol.notnull) {
-      db.exec(`
+      (await dbExec(`
         CREATE TABLE T27_Requisition_new (
           T27_Requisition_ID INTEGER PRIMARY KEY AUTOINCREMENT,
           T27_01_Type TEXT,
@@ -191,7 +166,7 @@ function runMigrations(db) {
         INSERT INTO T27_Requisition_new SELECT T27_Requisition_ID, T27_01_Type, T11_Item_Master_PK, T27_02_Quantity_Requested, T27_03_Requested_By, T27_04_Requesting_Office, T27_05_Date_Requested, T27_06_Status, T27_07_Approved_By, T27_08_Notes, T14_SO_PK, T27_09_SRF_Number, T27_10_Reviewed_By, T27_11_Reviewed_Date, T27_12_Approved_By, T27_13_Approved_Date FROM T27_Requisition;
         DROP TABLE T27_Requisition;
         ALTER TABLE T27_Requisition_new RENAME TO T27_Requisition;
-      `);
+      `));
     }
   } catch (e) {
     console.error('Migration failed relaxing T27_Requisition constraint:', e.message);
@@ -246,24 +221,29 @@ app.get('/api/network-info', (req, res) => {
   res.json({ addresses, port: ACTUAL_PORT });
 });
 
-app.get('/api/auth/login-users', (req, res) => {
+app.get('/api/auth/login-users', async (req, res) => {
   try {
-    const rows = db.prepare(`SELECT T28_User_PK, T28_01_Name, T28_04_Department FROM T28_Users WHERE T28_05_Active = 1`).all();
+    // Deliberately NOT filtered to Active=1 — this only exists to answer
+    // "does at least one account exist at all", so the "Create the first
+    // account" screen doesn't keep reappearing for a Pending/rejected
+    // account (which the signup endpoint's own separate isFirstUser check
+    // already correctly refuses to treat as "the first").
+    const rows = (await dbAll(`SELECT T28_User_PK, T28_01_Name, T28_04_Department FROM T28_Users`));
     res.json(rows);
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
 });
 
-app.post('/api/auth/signup', (req, res) => {
+app.post('/api/auth/signup', async (req, res) => {
   try {
     const { name, username, password, requestedDepartment } = req.body;
     if (!name || !username || !password) return res.status(400).json({ error: 'Name, username, and password are required' });
     if (password.length < 6) return res.status(400).json({ error: 'Password must be at least 6 characters' });
-    const existing = db.prepare(`SELECT 1 FROM T28_Users WHERE T28_02_Username = ?`).get(username);
+    const existing = (await dbGet(`SELECT 1 FROM T28_Users WHERE T28_02_Username = ?`, [username]));
     if (existing) return res.status(400).json({ error: `Username "${username}" is already taken.` });
 
-    const isFirstUser = db.prepare(`SELECT COUNT(*) c FROM T28_Users`).get().c === 0;
+    const isFirstUser = (await dbGet(`SELECT COUNT(*) c FROM T28_Users`)).c === 0;
     const pk = genGuid();
     const hashed = bcrypt.hashSync(password, 10);
     // The very first account on a fresh install is auto-approved with full
@@ -273,10 +253,10 @@ app.post('/api/auth/signup', (req, res) => {
     const department = isFirstUser ? 'CSR' : (requestedDepartment || 'Unassigned');
     const active = isFirstUser ? 1 : 0;
 
-    db.prepare(`
+    (await dbRun(`
       INSERT INTO T28_Users (T28_User_PK, T28_01_Name, T28_02_Username, T28_03_Password, T28_04_Department, T28_05_Active, T28_06_Status)
       VALUES (?, ?, ?, ?, ?, ?, ?)
-    `).run(pk, name, username, hashed, department, active, status);
+    `, [pk, name, username, hashed, department, active, status]));
 
     if (isFirstUser) {
       req.session.user = { pk, name, department, role: null, allowedEntities: null };
@@ -288,11 +268,11 @@ app.post('/api/auth/signup', (req, res) => {
   }
 });
 
-app.post('/api/auth/login', (req, res) => {
+app.post('/api/auth/login', async (req, res) => {
   try {
     const { username, password } = req.body;
     if (!username || !password) return res.status(400).json({ error: 'Username and password are required' });
-    const user = db.prepare(`SELECT * FROM T28_Users WHERE T28_02_Username = ?`).get(username);
+    const user = (await dbGet(`SELECT * FROM T28_Users WHERE T28_02_Username = ?`, [username]));
     if (!user || !user.T28_03_Password || !bcrypt.compareSync(password, user.T28_03_Password)) {
       return res.status(401).json({ error: 'Invalid username or password' });
     }
@@ -333,21 +313,20 @@ function requireFullAccess(req, res, next) {
   next();
 }
 
-app.get('/api/auth/pending-users', requireFullAccess, (req, res) => {
+app.get('/api/auth/pending-users', requireFullAccess, async (req, res) => {
   try {
-    const rows = db.prepare(`SELECT T28_User_PK, T28_01_Name, T28_02_Username, T28_04_Department FROM T28_Users WHERE T28_06_Status = 'Pending'`).all();
+    const rows = (await dbAll(`SELECT T28_User_PK, T28_01_Name, T28_02_Username, T28_04_Department FROM T28_Users WHERE T28_06_Status = 'Pending'`));
     res.json(rows);
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
 });
 
-app.post('/api/auth/approve-user/:pk', requireFullAccess, (req, res) => {
+app.post('/api/auth/approve-user/:pk', requireFullAccess, async (req, res) => {
   try {
     const { department, allowedEntities } = req.body; // allowedEntities: array of entity keys, or null/[] for full access
     const entitiesStr = Array.isArray(allowedEntities) && allowedEntities.length ? allowedEntities.join(',') : null;
-    const result = db.prepare(`UPDATE T28_Users SET T28_06_Status = 'Approved', T28_05_Active = 1, T28_04_Department = ?, T28_07_Allowed_Entities = ? WHERE T28_User_PK = ?`)
-      .run(department || 'Unassigned', entitiesStr, req.params.pk);
+    const result = (await dbRun(`UPDATE T28_Users SET T28_06_Status = 'Approved', T28_05_Active = 1, T28_04_Department = ?, T28_07_Allowed_Entities = ? WHERE T28_User_PK = ?`, [department || 'Unassigned', entitiesStr, req.params.pk]));
     if (result.changes === 0) return res.status(404).json({ error: 'No user found with that ID.' });
     res.json({ ok: true });
   } catch (e) {
@@ -355,9 +334,9 @@ app.post('/api/auth/approve-user/:pk', requireFullAccess, (req, res) => {
   }
 });
 
-app.post('/api/auth/reject-user/:pk', requireFullAccess, (req, res) => {
+app.post('/api/auth/reject-user/:pk', requireFullAccess, async (req, res) => {
   try {
-    const result = db.prepare(`UPDATE T28_Users SET T28_06_Status = 'Rejected', T28_05_Active = 0 WHERE T28_User_PK = ?`).run(req.params.pk);
+    const result = (await dbRun(`UPDATE T28_Users SET T28_06_Status = 'Rejected', T28_05_Active = 0 WHERE T28_User_PK = ?`, [req.params.pk]));
     if (result.changes === 0) return res.status(404).json({ error: 'No user found with that ID.' });
     res.json({ ok: true });
   } catch (e) {
@@ -402,10 +381,10 @@ function checkEntityAccess(req, res, next) {
 // public so the login screen itself can function. Also allows creating the
 // very first user on a fresh install with no users yet (otherwise nobody
 // could ever log in to create one).
-app.use('/api', (req, res, next) => {
+app.use('/api', async (req, res, next) => {
   if (req.path.startsWith('/auth/')) return next();
   if (req.path === '/users' && req.method === 'POST') {
-    const count = db.prepare(`SELECT COUNT(*) c FROM T28_Users`).get().c;
+    const count = (await dbGet(`SELECT COUNT(*) c FROM T28_Users`)).c;
     if (count === 0) return next();
   }
   requireAuth(req, res, next);
@@ -469,13 +448,13 @@ function genGuid() {
 // Generates sequential document numbers like INT2600182 (prefix + 2-digit
 // year + 5-digit sequence) or SRF166 (prefix + plain sequence, no year).
 // Atomically increments a per-doc-type counter so numbers never repeat.
-function getNextDocNumber(prefix, { includeYear = true, digits = 5 } = {}) {
-  const row = db.prepare(`SELECT next_number FROM T29_DocCounters WHERE doc_type = ?`).get(prefix);
+async function getNextDocNumber(prefix, { includeYear = true, digits = 5 } = {}) {
+  const row = (await dbGet(`SELECT next_number FROM T29_DocCounters WHERE doc_type = ?`, [prefix]));
   const next = row ? row.next_number : 1;
   if (row) {
-    db.prepare(`UPDATE T29_DocCounters SET next_number = ? WHERE doc_type = ?`).run(next + 1, prefix);
+    (await dbRun(`UPDATE T29_DocCounters SET next_number = ? WHERE doc_type = ?`, [next + 1, prefix]));
   } else {
-    db.prepare(`INSERT INTO T29_DocCounters (doc_type, next_number) VALUES (?, ?)`).run(prefix, next + 1);
+    (await dbRun(`INSERT INTO T29_DocCounters (doc_type, next_number) VALUES (?, ?)`, [prefix, next + 1]));
   }
   const yearPart = includeYear ? String(new Date().getFullYear()).slice(-2) : '';
   const seqPart = digits > 0 ? String(next).padStart(digits, '0') : String(next);
@@ -494,27 +473,27 @@ app.get('/api/schema', (req, res) => {
 });
 
 // List rows for an entity, with FK display values joined in
-app.get('/api/:entity', (req, res) => {
+app.get('/api/:entity', async (req, res) => {
   const ent = getEntity(req.params.entity);
   if (!ent) return res.status(404).json({ error: 'Unknown entity' });
   try {
     const where = ent.filter ? ` WHERE "${ent.filter.field}" = ?` : '';
     const params = ent.filter ? [ent.filter.value] : [];
-    const rows = db.prepare(`SELECT * FROM "${ent.table}"${where}`).all(...params);
+    const rows = (await dbAll(`SELECT * FROM "${ent.table}"${where}`, [...params]));
     // attach resolved FK display labels
-    const enriched = rows.map(row => {
+    const enriched = await Promise.all(rows.map(async row => {
       const out = { ...row };
       for (const f of ent.fields) {
         if (f.fk && row[f.name]) {
           const fkEnt = ENTITIES[f.fk.table];
           if (fkEnt) {
-            const fkRow = db.prepare(`SELECT * FROM "${fkEnt.table}" WHERE "${fkEnt.pk}" = ?`).get(row[f.name]);
+            const fkRow = (await dbGet(`SELECT * FROM "${fkEnt.table}" WHERE "${fkEnt.pk}" = ?`, [row[f.name]]));
             out[`__${f.name}_label`] = fkRow ? fkRow[f.fk.display] : row[f.name];
           }
         }
       }
       return out;
-    });
+    }));
     res.json(enriched);
   } catch (e) {
     res.status(500).json({ error: e.message });
@@ -524,7 +503,7 @@ app.get('/api/:entity', (req, res) => {
 // Get FK dropdown options for a given entity (id + display label)
 // ?flag=customer|supplier filters contacts by their company's Customer/Supplier flag,
 // matching the original app's Q72_Lookup_Customer_from_Contact / Q73_Lookup_Supplier_from_Contact logic.
-app.get('/api/:entity/options', (req, res) => {
+app.get('/api/:entity/options', async (req, res) => {
   const ent = getEntity(req.params.entity);
   if (!ent) return res.status(404).json({ error: 'Unknown entity' });
   try {
@@ -532,24 +511,24 @@ app.get('/api/:entity/options', (req, res) => {
     let labelFn = (r) => r[ent.displayField] || `(no ${ent.displayField})`;
     if (req.params.entity === 'contacts' && (req.query.flag === 'customer' || req.query.flag === 'supplier')) {
       const flagCol = req.query.flag === 'customer' ? 'T01_15_Customer' : 'T01_16_Supplier';
-      rows = db.prepare(`
+      rows = (await dbAll(`
         SELECT c.*, comp."T01_01_Company_Name" as __companyName FROM "T07_Contacts" c
         JOIN "T01_Company" comp ON comp."T01_PK" = c."T01_PK"
         WHERE comp."${flagCol}" = 1 AND c."T07_11_Obsolete" = 0 AND comp."T01_14_Obsolete" = 0
-      `).all();
+      `));
       // Show the Company Name (not the individual contact's name) — that's who
       // you're actually doing business with on a Sales/Purchase Order.
       labelFn = (r) => r.__companyName || r[ent.displayField] || '(no company)';
     } else if (req.params.entity === 'contacts') {
       // Any other contact picker (e.g. Ship To) — still show Company Name
       // first, falling back to the contact's own name if they have no company.
-      rows = db.prepare(`
+      rows = (await dbAll(`
         SELECT c.*, comp."T01_01_Company_Name" as __companyName FROM "T07_Contacts" c
         LEFT JOIN "T01_Company" comp ON comp."T01_PK" = c."T01_PK"
-      `).all();
+      `));
       labelFn = (r) => r.__companyName || [r.T07_01_Forename, r.T07_02_Surname].filter(Boolean).join(' ') || '(no name)';
     } else {
-      rows = db.prepare(`SELECT * FROM "${ent.table}"`).all();
+      rows = (await dbAll(`SELECT * FROM "${ent.table}"`));
     }
     const options = rows.map(r => ({
       id: ent.pk ? r[ent.pk] : r._rowid,
@@ -562,19 +541,19 @@ app.get('/api/:entity/options', (req, res) => {
 });
 
 // Get single row
-app.get('/api/:entity/:id', (req, res) => {
+app.get('/api/:entity/:id', async (req, res) => {
   const ent = getEntity(req.params.entity);
   if (!ent) return res.status(404).json({ error: 'Unknown entity' });
   const pkCol = ent.pk || '_rowid';
   const filterClause = ent.filter ? ` AND "${ent.filter.field}" = ?` : '';
   const filterParams = ent.filter ? [ent.filter.value] : [];
-  const row = db.prepare(`SELECT * FROM "${ent.table}" WHERE "${pkCol}" = ?${filterClause}`).get(req.params.id, ...filterParams);
+  const row = (await dbGet(`SELECT * FROM "${ent.table}" WHERE "${pkCol}" = ?${filterClause}`, [req.params.id, ...filterParams]));
   if (!row) return res.status(404).json({ error: 'Not found' });
   res.json(row);
 });
 
 // Create
-app.post('/api/:entity', (req, res) => {
+app.post('/api/:entity', async (req, res) => {
   const ent = getEntity(req.params.entity);
   if (!ent) return res.status(404).json({ error: 'Unknown entity' });
   try {
@@ -588,14 +567,14 @@ app.post('/api/:entity', (req, res) => {
     // Items are identified by Part Number now — enforce uniqueness with a
     // clear error instead of letting a raw constraint failure surface.
     if (req.params.entity === 'items' && body.T11_01_Part_Number) {
-      const existing = db.prepare(`SELECT 1 FROM "T11_Item_Master" WHERE "T11_01_Part_Number" = ?`).get(body.T11_01_Part_Number);
+      const existing = (await dbGet(`SELECT 1 FROM "T11_Item_Master" WHERE "T11_01_Part_Number" = ?`, [body.T11_01_Part_Number]));
       if (existing) return res.status(400).json({ error: `Part Number "${body.T11_01_Part_Number}" already exists. Part Number must be unique.` });
     }
 
     // Auto-assign a sequential SRF number (e.g. SRF166) on new requisitions
     // (both Stock and Purchase share the same SRF sequence).
     if ((req.params.entity === 'stockRequisitions' || req.params.entity === 'purchaseRequisitions') && !body.T27_09_SRF_Number) {
-      body.T27_09_SRF_Number = getNextDocNumber('SRF', { includeYear: false, digits: 0 });
+      body.T27_09_SRF_Number = await getNextDocNumber('SRF', { includeYear: false, digits: 0 });
     }
 
     // Hash the password before storing it — never save plain text.
@@ -603,7 +582,7 @@ app.post('/api/:entity', (req, res) => {
       body.T28_03_Password = bcrypt.hashSync(body.T28_03_Password, 10);
     }
     if (req.params.entity === 'users' && body.T28_02_Username) {
-      const existingUser = db.prepare(`SELECT 1 FROM T28_Users WHERE T28_02_Username = ?`).get(body.T28_02_Username);
+      const existingUser = (await dbGet(`SELECT 1 FROM T28_Users WHERE T28_02_Username = ?`, [body.T28_02_Username]));
       if (existingUser) return res.status(400).json({ error: `Username "${body.T28_02_Username}" is already taken.` });
     }
 
@@ -627,11 +606,26 @@ app.post('/api/:entity', (req, res) => {
       vals.push(ent.filter.value);
     }
     const placeholders = cols.map(() => '?').join(',');
-    const stmt = db.prepare(`INSERT INTO "${ent.table}" (${cols.map(c => `"${c}"`).join(',')}) VALUES (${placeholders})`);
-    const info = stmt.run(...vals);
+    const insertSql = `INSERT INTO "${ent.table}" (${cols.map(c => `"${c}"`).join(',')}) VALUES (${placeholders})`;
+    const info = await dbRun(insertSql, vals);
     const pkCol = ent.pk || '_rowid';
     const newId = ent.pk && ent.pkType === 'text' ? vals[0] : info.lastInsertRowid;
-    const created = db.prepare(`SELECT * FROM "${ent.table}" WHERE "${pkCol}" = ?`).get(newId);
+    const created = (await dbGet(`SELECT * FROM "${ent.table}" WHERE "${pkCol}" = ?`, [newId]));
+
+    // A brand-new Company can't show up in the Sales/Purchase Order "Contact"
+    // picker until it has at least one Contact person — that picker joins
+    // Contacts to Companies, it doesn't list bare companies. Rather than
+    // leave a newly-added company invisible until someone remembers to add
+    // a contact separately, auto-create a placeholder one so it's usable
+    // immediately. The user can rename/replace it later like any contact.
+    if (req.params.entity === 'companies' && (created.T01_15_Customer || created.T01_16_Supplier)) {
+      const contactPk = genGuid();
+      await dbRun(
+        `INSERT INTO "T07_Contacts" ("T07_PK", "T07_01_Forename", "T01_PK", "T07_11_Obsolete") VALUES (?, ?, ?, 0)`,
+        [contactPk, 'Main Contact', newId]
+      );
+    }
+
     res.status(201).json(created);
   } catch (e) {
     res.status(400).json({ error: e.message });
@@ -639,7 +633,7 @@ app.post('/api/:entity', (req, res) => {
 });
 
 // Update
-app.put('/api/:entity/:id', (req, res) => {
+app.put('/api/:entity/:id', async (req, res) => {
   const ent = getEntity(req.params.entity);
   if (!ent) return res.status(404).json({ error: 'Unknown entity' });
   const pkCol = ent.pk || '_rowid';
@@ -647,7 +641,7 @@ app.put('/api/:entity/:id', (req, res) => {
     const body = req.body;
 
     if (req.params.entity === 'items' && body.T11_01_Part_Number) {
-      const existing = db.prepare(`SELECT 1 FROM "T11_Item_Master" WHERE "T11_01_Part_Number" = ? AND "T11_Item_Master_PK" != ?`).get(body.T11_01_Part_Number, req.params.id);
+      const existing = (await dbGet(`SELECT 1 FROM "T11_Item_Master" WHERE "T11_01_Part_Number" = ? AND "T11_Item_Master_PK" != ?`, [body.T11_01_Part_Number, req.params.id]));
       if (existing) return res.status(400).json({ error: `Part Number "${body.T11_01_Part_Number}" already exists. Part Number must be unique.` });
     }
 
@@ -677,8 +671,23 @@ app.put('/api/:entity/:id', (req, res) => {
     vals.push(req.params.id);
     const filterClause = ent.filter ? ` AND "${ent.filter.field}" = ?` : '';
     if (ent.filter) vals.push(ent.filter.value);
-    db.prepare(`UPDATE "${ent.table}" SET ${sets.join(', ')} WHERE "${pkCol}" = ?${filterClause}`).run(...vals);
-    const updated = db.prepare(`SELECT * FROM "${ent.table}" WHERE "${pkCol}" = ?`).get(req.params.id);
+    (await dbRun(`UPDATE "${ent.table}" SET ${sets.join(', ')} WHERE "${pkCol}" = ?${filterClause}`, [...vals]));
+    const updated = (await dbGet(`SELECT * FROM "${ent.table}" WHERE "${pkCol}" = ?`, [req.params.id]));
+
+    // Same reasoning as the create path: if Customer/Supplier just got
+    // switched on for a company that has no contact yet, give it one now
+    // so it's immediately usable in Sales/Purchase Order pickers.
+    if (req.params.entity === 'companies' && (updated.T01_15_Customer || updated.T01_16_Supplier)) {
+      const hasContact = (await dbGet(`SELECT 1 FROM "T07_Contacts" WHERE "T01_PK" = ? AND "T07_11_Obsolete" = 0`, [req.params.id]));
+      if (!hasContact) {
+        const contactPk = genGuid();
+        await dbRun(
+          `INSERT INTO "T07_Contacts" ("T07_PK", "T07_01_Forename", "T01_PK", "T07_11_Obsolete") VALUES (?, ?, ?, 0)`,
+          [contactPk, 'Main Contact', req.params.id]
+        );
+      }
+    }
+
     res.json(updated);
   } catch (e) {
     res.status(400).json({ error: e.message });
@@ -686,14 +695,14 @@ app.put('/api/:entity/:id', (req, res) => {
 });
 
 // Delete
-app.delete('/api/:entity/:id', (req, res) => {
+app.delete('/api/:entity/:id', async (req, res) => {
   const ent = getEntity(req.params.entity);
   if (!ent) return res.status(404).json({ error: 'Unknown entity' });
   const pkCol = ent.pk || '_rowid';
   try {
     const filterClause = ent.filter ? ` AND "${ent.filter.field}" = ?` : '';
     const filterParams = ent.filter ? [ent.filter.value] : [];
-    db.prepare(`DELETE FROM "${ent.table}" WHERE "${pkCol}" = ?${filterClause}`).run(req.params.id, ...filterParams);
+    (await dbRun(`DELETE FROM "${ent.table}" WHERE "${pkCol}" = ?${filterClause}`, [req.params.id, ...filterParams]));
     res.status(204).end();
   } catch (e) {
     res.status(400).json({ error: e.message });
@@ -706,14 +715,14 @@ app.delete('/api/:entity/:id', (req, res) => {
 // All Sales-Quotes-Purchases / Documents), mirroring the original
 // Access form's subforms.
 // ---------------------------------------------------------------------
-app.get('/api/items/:id/full', (req, res) => {
+app.get('/api/items/:id/full', async (req, res) => {
   const id = req.params.id;
   try {
-    const item = db.prepare(`SELECT * FROM "T11_Item_Master" WHERE "T11_Item_Master_PK" = ?`).get(id);
+    const item = (await dbGet(`SELECT * FROM "T11_Item_Master" WHERE "T11_Item_Master_PK" = ?`, [id]));
     if (!item) return res.status(404).json({ error: 'Item not found' });
 
     const category = item.T12_Category_PK
-      ? db.prepare(`SELECT * FROM "T12_Category" WHERE "T12_Category_PK" = ?`).get(item.T12_Category_PK)
+      ? (await dbGet(`SELECT * FROM "T12_Category" WHERE "T12_Category_PK" = ?`, [item.T12_Category_PK]))
       : null;
 
     // Specifications: Param1..20 / Value1..20 pairs, only non-empty
@@ -727,7 +736,7 @@ app.get('/api/items/:id/full', (req, res) => {
     }
 
     // All Sales Order lines containing this item (joined to SO header + customer)
-    const soLines = db.prepare(`
+    const soLines = (await dbAll(`
       SELECT sd."T15_01_Quantity" AS qty, sd."T15_02_Price" AS price,
              so."T14_SO_PK" AS soPk, so."T14_01_SO_Number" AS soNumber,
              so."T14_03_Quote_Date" AS quoteDate, so."T14_04_Sale_Date" AS saleDate,
@@ -739,10 +748,10 @@ app.get('/api/items/:id/full', (req, res) => {
       LEFT JOIN "T01_Company" c ON c."T01_PK" = ct."T01_PK"
       WHERE sd."T11_Item_Master_PK" = ?
       ORDER BY so."T14_01_SO_Number" DESC
-    `).all(id);
+    `, [id]));
 
     // All Purchase Order lines containing this item (joined to PO header + supplier)
-    const poLines = db.prepare(`
+    const poLines = (await dbAll(`
       SELECT pd."T18_01_Quantity" AS qty, pd."T18_02_Price" AS price,
              po."T17_PO_PK" AS poPk, po."T17_01_PO_Number" AS poNumber,
              po."T17_02_PO_Date" AS poDate, po."T17_03_Received_Date" AS receivedDate,
@@ -754,7 +763,7 @@ app.get('/api/items/:id/full', (req, res) => {
       LEFT JOIN "T01_Company" c ON c."T01_PK" = ct."T01_PK"
       WHERE pd."T11_Item_Master_PK" = ?
       ORDER BY po."T17_01_PO_Number" DESC
-    `).all(id);
+    `, [id]));
 
     const today = new Date().toISOString().slice(0, 10);
 
@@ -768,20 +777,20 @@ app.get('/api/items/:id/full', (req, res) => {
     const qtyAllocated = soLines.filter(l => !l.despatchDate).reduce((s, l) => s + (Number(l.qty) || 0), 0);
 
     // Stocktake tab: raw stock movement history
-    const stockHistory = db.prepare(`
+    const stockHistory = (await dbAll(`
       SELECT "T23_Stock_ID" AS id, "T23_01_Date" AS date, "T23_02_Quantity" AS qty
       FROM "T23_Stock" WHERE "T11_Item_Master_PK" = ? ORDER BY "T23_01_Date" DESC
-    `).all(id);
+    `, [id]));
     const latestStockTake = stockHistory[0] || null;
 
     // Serial numbers tied to this item
-    const serialNumbers = db.prepare(`
+    const serialNumbers = (await dbAll(`
       SELECT "T24_Serial_PK" AS id, "T24_01_Date" AS date, "T24_02_Notes" AS notes
       FROM "T24_Serial_Numbers" WHERE "T11_Item_Master_PK" = ? ORDER BY "T24_01_Date" DESC
-    `).all(id);
+    `, [id]));
 
     // Documents tab: joined through T19_Item_Doc_Join
-    const documents = db.prepare(`
+    const documents = (await dbAll(`
       SELECT d."T10_Document_PK" AS id, d."T10_01_Document_Number" AS docNumber,
              d."T10_02_Alt_Ref_Number" AS altRef, d."T10_03_Short_Description" AS shortDesc,
              d."T10_04_Long Description" AS longDesc, d."T10_06_Obsolete" AS obsolete,
@@ -790,7 +799,7 @@ app.get('/api/items/:id/full', (req, res) => {
       JOIN "T10_Documents" d ON d."T10_Document_PK" = j."T10_Document_PK"
       LEFT JOIN "T09_Directory" dir ON dir."T09_Directory_PK" = d."T09_Directory_PK"
       WHERE j."T11_Item_Master_PK" = ?
-    `).all(id);
+    `, [id]));
 
     res.json({
       item, category, specs,
@@ -809,11 +818,11 @@ app.get('/api/items/:id/full', (req, res) => {
 // ---------------------------------------------------------------------
 // Sales Order full screen — header + Bill/Ship contact info + line items
 // ---------------------------------------------------------------------
-function contactSummary(pk) {
+async function contactSummary(pk) {
   if (!pk) return null;
-  const c = db.prepare(`SELECT * FROM "T07_Contacts" WHERE "T07_PK" = ?`).get(pk);
+  const c = (await dbGet(`SELECT * FROM "T07_Contacts" WHERE "T07_PK" = ?`, [pk]));
   if (!c) return null;
-  const company = c.T01_PK ? db.prepare(`SELECT * FROM "T01_Company" WHERE "T01_PK" = ?`).get(c.T01_PK) : null;
+  const company = c.T01_PK ? (await dbGet(`SELECT * FROM "T01_Company" WHERE "T01_PK" = ?`, [c.T01_PK])) : null;
   return {
     pk: c.T07_PK,
     name: [c.T07_01_Forename, c.T07_02_Surname].filter(Boolean).join(' '),
@@ -824,15 +833,15 @@ function contactSummary(pk) {
   };
 }
 
-app.get('/api/sales-orders/:id/full', (req, res) => {
+app.get('/api/sales-orders/:id/full', async (req, res) => {
   const id = req.params.id;
   try {
     if (id === 'new') {
       return res.json({ so: {}, billTo: null, shipTo: null, lines: [], fulfillment: {} });
     }
-    const so = db.prepare(`SELECT * FROM "T14_Sales_Orders" WHERE "T14_SO_PK" = ?`).get(id);
+    const so = (await dbGet(`SELECT * FROM "T14_Sales_Orders" WHERE "T14_SO_PK" = ?`, [id]));
     if (!so) return res.status(404).json({ error: 'Not found' });
-    const lines = db.prepare(`
+    const lines = (await dbAll(`
       SELECT sd.rowid as lineId, sd.*, i."T11_01_Part_Number" as partNumber,
              COALESCE(sd."T15_06_Description_Override", i."T11_03_Short_Description") as description,
              COALESCE(sd."T15_03_Retail", i."T11_09_List_Price") as retail,
@@ -840,12 +849,12 @@ app.get('/api/sales-orders/:id/full', (req, res) => {
              COALESCE(sd."T15_05_OEM", i."T11_11_OEM_Price") as oem
       FROM "T15_SO_Details" sd LEFT JOIN "T11_Item_Master" i ON i."T11_Item_Master_PK" = sd."T11_Item_Master_PK"
       WHERE sd."T14_SO_PK" = ?
-    `).all(id);
-    const fulfillment = db.prepare(`SELECT * FROM "T25_SO_Fulfillment" WHERE "T14_SO_PK" = ?`).get(id) || {};
+    `, [id]));
+    const fulfillment = (await dbGet(`SELECT * FROM "T25_SO_Fulfillment" WHERE "T14_SO_PK" = ?`, [id])) || {};
     res.json({
       so,
-      billTo: contactSummary(so.T07_PK),
-      shipTo: contactSummary(so.T07_PK_SHIPTO),
+      billTo: await contactSummary(so.T07_PK),
+      shipTo: await contactSummary(so.T07_PK_SHIPTO),
       lines,
       fulfillment,
     });
@@ -855,36 +864,35 @@ app.get('/api/sales-orders/:id/full', (req, res) => {
 });
 
 // Save header + replace all line items in one call
-app.post('/api/sales-orders/full', (req, res) => saveSalesOrderFull(req, res, null));
-app.put('/api/sales-orders/:id/full', (req, res) => saveSalesOrderFull(req, res, req.params.id));
+app.post('/api/sales-orders/full', (req, res) => { saveSalesOrderFull(req, res, null); });
+app.put('/api/sales-orders/:id/full', (req, res) => { saveSalesOrderFull(req, res, req.params.id); });
 
-function saveSalesOrderFull(req, res, existingId) {
+async function saveSalesOrderFull(req, res, existingId) {
   try {
     const { so, lines, fulfillment } = req.body;
     const soFields = ENTITIES.salesOrders.fields.map(f => f.name);
     let soPk = existingId;
     if (!soPk) {
       soPk = genGuid();
-      const maxRow = db.prepare(`SELECT MAX("T14_01_SO_Number") AS m FROM "T14_Sales_Orders"`).get();
+      const maxRow = (await dbGet(`SELECT MAX("T14_01_SO_Number") AS m FROM "T14_Sales_Orders"`));
       so['T14_01_SO_Number'] = (maxRow.m || 0) + 1;
       const cols = ['T14_SO_PK', ...soFields];
       const vals = [soPk, ...soFields.map(f => (so[f] === '' || so[f] === undefined) ? null : so[f])];
-      db.prepare(`INSERT INTO "T14_Sales_Orders" (${cols.map(c => `"${c}"`).join(',')}) VALUES (${cols.map(() => '?').join(',')})`).run(...vals);
+      (await dbRun(`INSERT INTO "T14_Sales_Orders" (${cols.map(c => `"${c}"`).join(',')}) VALUES (${cols.map(() => '?').join(',')})`, [...vals]));
     } else {
       const updateFields = soFields.filter(f => f !== 'T14_01_SO_Number');
       const sets = updateFields.map(f => `"${f}" = ?`).join(', ');
       const vals = updateFields.map(f => (so[f] === '' || so[f] === undefined) ? null : so[f]);
-      db.prepare(`UPDATE "T14_Sales_Orders" SET ${sets} WHERE "T14_SO_PK" = ?`).run(...vals, soPk);
+      (await dbRun(`UPDATE "T14_Sales_Orders" SET ${sets} WHERE "T14_SO_PK" = ?`, [...vals, soPk]));
     }
-    db.prepare(`DELETE FROM "T15_SO_Details" WHERE "T14_SO_PK" = ?`).run(soPk);
+    (await dbRun(`DELETE FROM "T15_SO_Details" WHERE "T14_SO_PK" = ?`, [soPk]));
     for (const l of (lines || [])) {
       if (!l.T11_Item_Master_PK) continue;
-      db.prepare(`INSERT INTO "T15_SO_Details" ("T14_SO_PK","T11_Item_Master_PK","T15_01_Quantity","T15_02_Price","T15_03_Retail","T15_04_Trade","T15_05_OEM","T15_06_Description_Override") VALUES (?,?,?,?,?,?,?,?)`)
-        .run(soPk, l.T11_Item_Master_PK, Number(l.T15_01_Quantity) || 0, Number(l.T15_02_Price) || 0,
+      (await dbRun(`INSERT INTO "T15_SO_Details" ("T14_SO_PK","T11_Item_Master_PK","T15_01_Quantity","T15_02_Price","T15_03_Retail","T15_04_Trade","T15_05_OEM","T15_06_Description_Override") VALUES (?,?,?,?,?,?,?,?)`, [soPk, l.T11_Item_Master_PK, Number(l.T15_01_Quantity) || 0, Number(l.T15_02_Price) || 0,
           l.retail === '' || l.retail === undefined || l.retail === null ? null : Number(l.retail),
           l.trade === '' || l.trade === undefined || l.trade === null ? null : Number(l.trade),
           l.oem === '' || l.oem === undefined || l.oem === null ? null : Number(l.oem),
-          l.description === '' || l.description === undefined ? null : l.description);
+          l.description === '' || l.description === undefined ? null : l.description]));
     }
     if (fulfillment) {
       const fFields = ENTITIES.soFulfillment.fields.map(f => f.name);
@@ -895,13 +903,13 @@ function saveSalesOrderFull(req, res, existingId) {
         if (boolFields.has(f)) v = v ? 1 : 0;
         return v;
       });
-      db.prepare(`
+      (await dbRun(`
         INSERT INTO "T25_SO_Fulfillment" ("T14_SO_PK", ${fFields.map(f => `"${f}"`).join(',')})
         VALUES (?, ${fFields.map(() => '?').join(',')})
         ON CONFLICT("T14_SO_PK") DO UPDATE SET ${fFields.map(f => `"${f}" = excluded."${f}"`).join(', ')}
-      `).run(soPk, ...vals);
+      `, [soPk, ...vals]));
     }
-    const updated = db.prepare(`SELECT * FROM "T14_Sales_Orders" WHERE "T14_SO_PK" = ?`).get(soPk);
+    const updated = (await dbGet(`SELECT * FROM "T14_Sales_Orders" WHERE "T14_SO_PK" = ?`, [soPk]));
     res.status(existingId ? 200 : 201).json({ so: updated });
   } catch (e) {
     res.status(400).json({ error: e.message });
@@ -911,57 +919,56 @@ function saveSalesOrderFull(req, res, existingId) {
 // ---------------------------------------------------------------------
 // Purchase Order full screen — header + Supplier info + line items
 // ---------------------------------------------------------------------
-app.get('/api/purchase-orders/:id/full', (req, res) => {
+app.get('/api/purchase-orders/:id/full', async (req, res) => {
   const id = req.params.id;
   try {
     if (id === 'new') {
       return res.json({ po: {}, supplier: null, lines: [] });
     }
-    const po = db.prepare(`SELECT * FROM "T17_Purchase_Orders" WHERE "T17_PO_PK" = ?`).get(id);
+    const po = (await dbGet(`SELECT * FROM "T17_Purchase_Orders" WHERE "T17_PO_PK" = ?`, [id]));
     if (!po) return res.status(404).json({ error: 'Not found' });
-    const lines = db.prepare(`
+    const lines = (await dbAll(`
       SELECT pd.rowid as lineId, pd.*, i."T11_01_Part_Number" as partNumber,
              COALESCE(pd."T18_04_Description_Override", i."T11_03_Short_Description") as description,
              COALESCE(pd."T18_03_Cost", i."T11_53_COST") as cost
       FROM "T18_PO_Details" pd LEFT JOIN "T11_Item_Master" i ON i."T11_Item_Master_PK" = pd."T11_Item_Master_PK"
       WHERE pd."T17_PO_PK" = ?
-    `).all(id);
-    res.json({ po, supplier: contactSummary(po.T07_PK), lines });
+    `, [id]));
+    res.json({ po, supplier: await contactSummary(po.T07_PK), lines });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
 });
 
-app.post('/api/purchase-orders/full', (req, res) => savePurchaseOrderFull(req, res, null));
-app.put('/api/purchase-orders/:id/full', (req, res) => savePurchaseOrderFull(req, res, req.params.id));
+app.post('/api/purchase-orders/full', (req, res) => { savePurchaseOrderFull(req, res, null); });
+app.put('/api/purchase-orders/:id/full', (req, res) => { savePurchaseOrderFull(req, res, req.params.id); });
 
-function savePurchaseOrderFull(req, res, existingId) {
+async function savePurchaseOrderFull(req, res, existingId) {
   try {
     const { po, lines } = req.body;
     const poFields = ENTITIES.purchaseOrders.fields.map(f => f.name);
     let poPk = existingId;
     if (!poPk) {
       poPk = genGuid();
-      const maxRow = db.prepare(`SELECT MAX("T17_01_PO_Number") AS m FROM "T17_Purchase_Orders"`).get();
+      const maxRow = (await dbGet(`SELECT MAX("T17_01_PO_Number") AS m FROM "T17_Purchase_Orders"`));
       po['T17_01_PO_Number'] = (maxRow.m || 0) + 1;
       const cols = ['T17_PO_PK', ...poFields];
       const vals = [poPk, ...poFields.map(f => (po[f] === '' || po[f] === undefined) ? null : po[f])];
-      db.prepare(`INSERT INTO "T17_Purchase_Orders" (${cols.map(c => `"${c}"`).join(',')}) VALUES (${cols.map(() => '?').join(',')})`).run(...vals);
+      (await dbRun(`INSERT INTO "T17_Purchase_Orders" (${cols.map(c => `"${c}"`).join(',')}) VALUES (${cols.map(() => '?').join(',')})`, [...vals]));
     } else {
       const updateFields = poFields.filter(f => f !== 'T17_01_PO_Number');
       const sets = updateFields.map(f => `"${f}" = ?`).join(', ');
       const vals = updateFields.map(f => (po[f] === '' || po[f] === undefined) ? null : po[f]);
-      db.prepare(`UPDATE "T17_Purchase_Orders" SET ${sets} WHERE "T17_PO_PK" = ?`).run(...vals, poPk);
+      (await dbRun(`UPDATE "T17_Purchase_Orders" SET ${sets} WHERE "T17_PO_PK" = ?`, [...vals, poPk]));
     }
-    db.prepare(`DELETE FROM "T18_PO_Details" WHERE "T17_PO_PK" = ?`).run(poPk);
+    (await dbRun(`DELETE FROM "T18_PO_Details" WHERE "T17_PO_PK" = ?`, [poPk]));
     for (const l of (lines || [])) {
       if (!l.T11_Item_Master_PK) continue;
-      db.prepare(`INSERT INTO "T18_PO_Details" ("T17_PO_PK","T11_Item_Master_PK","T18_01_Quantity","T18_02_Price","T18_03_Cost","T18_04_Description_Override") VALUES (?,?,?,?,?,?)`)
-        .run(poPk, l.T11_Item_Master_PK, Number(l.T18_01_Quantity) || 0, Number(l.T18_02_Price) || 0,
+      (await dbRun(`INSERT INTO "T18_PO_Details" ("T17_PO_PK","T11_Item_Master_PK","T18_01_Quantity","T18_02_Price","T18_03_Cost","T18_04_Description_Override") VALUES (?,?,?,?,?,?)`, [poPk, l.T11_Item_Master_PK, Number(l.T18_01_Quantity) || 0, Number(l.T18_02_Price) || 0,
           l.cost === '' || l.cost === undefined || l.cost === null ? null : Number(l.cost),
-          l.description === '' || l.description === undefined ? null : l.description);
+          l.description === '' || l.description === undefined ? null : l.description]));
     }
-    const updated = db.prepare(`SELECT * FROM "T17_Purchase_Orders" WHERE "T17_PO_PK" = ?`).get(poPk);
+    const updated = (await dbGet(`SELECT * FROM "T17_Purchase_Orders" WHERE "T17_PO_PK" = ?`, [poPk]));
     res.status(existingId ? 200 : 201).json({ po: updated });
   } catch (e) {
     res.status(400).json({ error: e.message });
@@ -972,18 +979,18 @@ function savePurchaseOrderFull(req, res, existingId) {
 // Company full screen — header + City/State/Postcode + Contacts /
 // Sales Activity / All Purchases tabs
 // ---------------------------------------------------------------------
-app.get('/api/companies/:id/full', (req, res) => {
+app.get('/api/companies/:id/full', async (req, res) => {
   const id = req.params.id;
   try {
     if (id === 'new') return res.json({ company: {}, city: null, contacts: [], salesActivity: [], allPurchases: [], projects: [] });
-    const company = db.prepare(`SELECT * FROM "T01_Company" WHERE "T01_PK" = ?`).get(id);
+    const company = (await dbGet(`SELECT * FROM "T01_Company" WHERE "T01_PK" = ?`, [id]));
     if (!company) return res.status(404).json({ error: 'Not found' });
-    const city = company.T02_City_PK ? db.prepare(`SELECT * FROM "T02_CityStatePCode" WHERE "T02_City_PK" = ?`).get(company.T02_City_PK) : null;
+    const city = company.T02_City_PK ? (await dbGet(`SELECT * FROM "T02_CityStatePCode" WHERE "T02_City_PK" = ?`, [company.T02_City_PK])) : null;
 
-    const contacts = db.prepare(`SELECT * FROM "T07_Contacts" WHERE "T01_PK" = ?`).all(id);
+    const contacts = (await dbAll(`SELECT * FROM "T07_Contacts" WHERE "T01_PK" = ?`, [id]));
 
     // Sales Activity: all SO line items for sales orders whose contact belongs to this company
-    const salesActivity = db.prepare(`
+    const salesActivity = (await dbAll(`
       SELECT so."T14_01_SO_Number" as soNo, so."T14_03_Quote_Date" as quoteDate, so."T14_04_Sale_Date" as saleDate,
              sd."T15_01_Quantity" as qty, i."T11_02_Alt_Part_Number" as altPartNumber, i."T11_03_Short_Description" as description
       FROM "T15_SO_Details" sd
@@ -992,10 +999,10 @@ app.get('/api/companies/:id/full', (req, res) => {
       LEFT JOIN "T11_Item_Master" i ON i."T11_Item_Master_PK" = sd."T11_Item_Master_PK"
       WHERE ct."T01_PK" = ?
       ORDER BY so."T14_01_SO_Number" DESC
-    `).all(id);
+    `, [id]));
 
     // All Purchases: all PO line items for purchase orders whose contact (supplier) belongs to this company
-    const allPurchases = db.prepare(`
+    const allPurchases = (await dbAll(`
       SELECT po."T17_01_PO_Number" as poNo, po."T17_02_PO_Date" as poDate, po."T17_03_Received_Date" as receivedDate,
              pd."T18_01_Quantity" as qty, i."T11_02_Alt_Part_Number" as altPartNumber, i."T11_03_Short_Description" as description
       FROM "T18_PO_Details" pd
@@ -1004,13 +1011,13 @@ app.get('/api/companies/:id/full', (req, res) => {
       LEFT JOIN "T11_Item_Master" i ON i."T11_Item_Master_PK" = pd."T11_Item_Master_PK"
       WHERE ct."T01_PK" = ?
       ORDER BY po."T17_01_PO_Number" DESC
-    `).all(id);
+    `, [id]));
 
     // Projects linked directly to this company/customer
-    const projects = db.prepare(`
+    const projects = (await dbAll(`
       SELECT "T21_Project_ID" as id, "T21_02_Project_Code" as code, "T21_03_Project_Name" as name, "T21_01_Project_Notes" as notes
       FROM "T21_Projects" WHERE "T01_PK" = ? ORDER BY "T21_02_Project_Code"
-    `).all(id);
+    `, [id]));
 
     res.json({ company, city, contacts, salesActivity, allPurchases, projects });
   } catch (e) {
@@ -1024,15 +1031,15 @@ app.get('/api/companies/:id/full', (req, res) => {
 // against actual quantities sold in Sales Order lines within that quarter.
 // Also exposed as raw JSON for any future in-app use.
 // ---------------------------------------------------------------------
-function computeForecastVariance(db) {
-  const forecasts = db.prepare(`
+async function computeForecastVariance(db) {
+  const forecasts = (await dbAll(`
     SELECT f.*, i."T11_01_Part_Number" as partNumber, i."T11_03_Short_Description" as itemDesc,
            c."T01_01_Company_Name" as customerName
     FROM "T26_Forecast" f
     LEFT JOIN "T11_Item_Master" i ON i."T11_Item_Master_PK" = f."T11_Item_Master_PK"
     LEFT JOIN "T01_Company" c ON c."T01_PK" = f."T01_PK"
     ORDER BY f."T26_04_Quarter" DESC, i."T11_01_Part_Number"
-  `).all();
+  `));
 
   const quarterBounds = (q) => {
     const m = /^(\d{4})-Q([1-4])$/i.exec(String(q || '').trim());
@@ -1045,17 +1052,17 @@ function computeForecastVariance(db) {
     return [`${year}-${startMonth}-01`, `${year}-${endMonth}-${String(lastDay).padStart(2, '0')}`];
   };
 
-  return forecasts.map((f) => {
+  return Promise.all(forecasts.map(async (f) => {
     const [start, end] = quarterBounds(f.T26_04_Quarter);
     let actualQty = 0;
     if (start && end) {
-      const actual = db.prepare(`
+      const actual = (await dbGet(`
         SELECT COALESCE(SUM(sd."T15_01_Quantity"), 0) as qty
         FROM "T15_SO_Details" sd
         JOIN "T14_Sales_Orders" so ON so."T14_SO_PK" = sd."T14_SO_PK"
         WHERE sd."T11_Item_Master_PK" = ?
           AND so."T14_04_Sale_Date" >= ? AND so."T14_04_Sale_Date" <= ?
-      `).get(f.T11_Item_Master_PK, start, end);
+      `, [f.T11_Item_Master_PK, start, end]));
       actualQty = actual.qty || 0;
     }
     const forecastQty = Number(f.T26_01_Forecast_Quantity) || 0;
@@ -1067,12 +1074,12 @@ function computeForecastVariance(db) {
       deliveryMonth: f.T26_02_Delivery_Month, forecastQty, actualQty, variance, variancePct,
       remarks: f.T26_03_Remarks,
     };
-  });
+  }));
 }
 
-app.get('/api/forecast-variance', (req, res) => {
+app.get('/api/forecast-variance', async (req, res) => {
   try {
-    res.json(computeForecastVariance(db));
+    res.json(await computeForecastVariance(db));
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
@@ -1083,20 +1090,20 @@ app.get('/api/forecast-variance', (req, res) => {
 // when a customer reports a faulty unit. Looks up the serial number's
 // warranty end date and auto-determines whether the unit is still covered.
 // ---------------------------------------------------------------------
-app.get('/api/sales-orders/:id/serials', (req, res) => {
+app.get('/api/sales-orders/:id/serials', async (req, res) => {
   try {
-    const serials = db.prepare(`
+    const serials = (await dbAll(`
       SELECT s.*, i."T11_01_Part_Number" as partNumber, i."T11_03_Short_Description" as itemDesc
       FROM "T24_Serial_Numbers" s LEFT JOIN "T11_Item_Master" i ON i."T11_Item_Master_PK" = s."T11_Item_Master_PK"
       WHERE s."T14_SO_PK" = ?
-    `).all(req.params.id);
+    `, [req.params.id]));
     res.json(serials);
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
 });
 
-app.post('/api/rma', (req, res) => {
+app.post('/api/rma', async (req, res) => {
   try {
     const { T14_SO_PK, T24_Serial_PK, T11_Item_Master_PK, T30_02_Reason, T30_03_Date_Requested, T30_07_Notes } = req.body;
     if (!T14_SO_PK || !T11_Item_Master_PK) return res.status(400).json({ error: 'Sales Order and Item are required' });
@@ -1104,49 +1111,48 @@ app.post('/api/rma', (req, res) => {
     // Compare today's date against the serial's warranty end date, if we have one.
     let underWarranty = null;
     if (T24_Serial_PK) {
-      const serial = db.prepare(`SELECT * FROM "T24_Serial_Numbers" WHERE "T24_Serial_PK" = ?`).get(T24_Serial_PK);
+      const serial = (await dbGet(`SELECT * FROM "T24_Serial_Numbers" WHERE "T24_Serial_PK" = ?`, [T24_Serial_PK]));
       if (serial && serial.T24_05_Warranty_End) {
         const today = new Date().toISOString().slice(0, 10);
         underWarranty = serial.T24_05_Warranty_End >= today ? 1 : 0;
       }
     }
 
-    const rmaNumber = getNextDocNumber('RMA');
+    const rmaNumber = await getNextDocNumber("RMA");
     const pk = genGuid();
-    db.prepare(`
+    (await dbRun(`
       INSERT INTO T30_RMA (T30_RMA_PK, T30_01_RMA_Number, T14_SO_PK, T24_Serial_PK, T11_Item_Master_PK, T30_02_Reason, T30_03_Date_Requested, T30_04_Under_Warranty, T30_05_Status, T30_07_Notes)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'Open', ?)
-    `).run(pk, rmaNumber, T14_SO_PK, T24_Serial_PK || null, T11_Item_Master_PK, T30_02_Reason || null, T30_03_Date_Requested || null, underWarranty, T30_07_Notes || null);
+    `, [pk, rmaNumber, T14_SO_PK, T24_Serial_PK || null, T11_Item_Master_PK, T30_02_Reason || null, T30_03_Date_Requested || null, underWarranty, T30_07_Notes || null]));
 
-    const created = db.prepare(`SELECT * FROM T30_RMA WHERE T30_RMA_PK = ?`).get(pk);
+    const created = (await dbGet(`SELECT * FROM T30_RMA WHERE T30_RMA_PK = ?`, [pk]));
     res.status(201).json(created);
   } catch (e) {
     res.status(400).json({ error: e.message });
   }
 });
 
-app.get('/api/rma', (req, res) => {
+app.get('/api/rma', async (req, res) => {
   try {
-    const rows = db.prepare(`
+    const rows = (await dbAll(`
       SELECT r.*, so."T14_01_SO_Number" as soNumber, i."T11_01_Part_Number" as partNumber, i."T11_03_Short_Description" as itemDesc, s."T24_03_Serial_Number" as serialNumber
       FROM T30_RMA r
       LEFT JOIN T14_Sales_Orders so ON so."T14_SO_PK" = r."T14_SO_PK"
       LEFT JOIN T11_Item_Master i ON i."T11_Item_Master_PK" = r."T11_Item_Master_PK"
       LEFT JOIN T24_Serial_Numbers s ON s."T24_Serial_PK" = r."T24_Serial_PK"
       ORDER BY r."T30_01_RMA_Number" DESC
-    `).all();
+    `));
     res.json(rows);
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
 });
 
-app.put('/api/rma/:id', (req, res) => {
+app.put('/api/rma/:id', async (req, res) => {
   try {
     const { T30_05_Status, T30_06_Resolution, T30_07_Notes } = req.body;
-    db.prepare(`UPDATE T30_RMA SET T30_05_Status = ?, T30_06_Resolution = ?, T30_07_Notes = ? WHERE T30_RMA_PK = ?`)
-      .run(T30_05_Status || null, T30_06_Resolution || null, T30_07_Notes || null, req.params.id);
-    const updated = db.prepare(`SELECT * FROM T30_RMA WHERE T30_RMA_PK = ?`).get(req.params.id);
+    (await dbRun(`UPDATE T30_RMA SET T30_05_Status = ?, T30_06_Resolution = ?, T30_07_Notes = ? WHERE T30_RMA_PK = ?`, [T30_05_Status || null, T30_06_Resolution || null, T30_07_Notes || null, req.params.id]));
+    const updated = (await dbGet(`SELECT * FROM T30_RMA WHERE T30_RMA_PK = ?`, [req.params.id]));
     res.json(updated);
   } catch (e) {
     res.status(400).json({ error: e.message });
@@ -1169,38 +1175,36 @@ function userHasRole(user, role) {
   return user.role === role;
 }
 
-app.post('/api/requisitions/:id/review', (req, res) => {
+app.post('/api/requisitions/:id/review', async (req, res) => {
   const user = req.session.user;
   if (!userHasRole(user, 'Reviewer')) return res.status(403).json({ error: 'Only a Reviewer (or full-access account) can review requisitions.' });
   try {
     const { decision, notes } = req.body; // decision: 'Reviewed' or 'Rejected'
     if (!['Reviewed', 'Rejected'].includes(decision)) return res.status(400).json({ error: 'decision must be "Reviewed" or "Rejected"' });
-    const req_ = db.prepare(`SELECT T27_06_Status FROM T27_Requisition WHERE T27_Requisition_ID = ?`).get(req.params.id);
+    const req_ = (await dbGet(`SELECT T27_06_Status FROM T27_Requisition WHERE T27_Requisition_ID = ?`, [req.params.id]));
     if (!req_) return res.status(404).json({ error: 'Requisition not found' });
     if (req_.T27_06_Status && req_.T27_06_Status !== 'Requested') {
       return res.status(400).json({ error: `This requisition is already past the review stage (current status: ${req_.T27_06_Status}).` });
     }
-    db.prepare(`UPDATE T27_Requisition SET T27_06_Status = ?, T27_10_Reviewed_By = ?, T27_11_Reviewed_Date = ?, T27_08_Notes = COALESCE(?, T27_08_Notes) WHERE T27_Requisition_ID = ?`)
-      .run(decision, user.name, new Date().toISOString().slice(0, 10), notes || null, req.params.id);
+    (await dbRun(`UPDATE T27_Requisition SET T27_06_Status = ?, T27_10_Reviewed_By = ?, T27_11_Reviewed_Date = ?, T27_08_Notes = COALESCE(?, T27_08_Notes) WHERE T27_Requisition_ID = ?`, [decision, user.name, new Date().toISOString().slice(0, 10), notes || null, req.params.id]));
     res.json({ ok: true, status: decision });
   } catch (e) {
     res.status(400).json({ error: e.message });
   }
 });
 
-app.post('/api/requisitions/:id/approve', (req, res) => {
+app.post('/api/requisitions/:id/approve', async (req, res) => {
   const user = req.session.user;
   if (!userHasRole(user, 'Manager')) return res.status(403).json({ error: 'Only a Manager (or full-access account) can approve requisitions.' });
   try {
     const { decision, notes } = req.body; // decision: 'Approved' or 'Rejected'
     if (!['Approved', 'Rejected'].includes(decision)) return res.status(400).json({ error: 'decision must be "Approved" or "Rejected"' });
-    const req_ = db.prepare(`SELECT T27_06_Status FROM T27_Requisition WHERE T27_Requisition_ID = ?`).get(req.params.id);
+    const req_ = (await dbGet(`SELECT T27_06_Status FROM T27_Requisition WHERE T27_Requisition_ID = ?`, [req.params.id]));
     if (!req_) return res.status(404).json({ error: 'Requisition not found' });
     if (req_.T27_06_Status !== 'Reviewed') {
       return res.status(400).json({ error: `This requisition must be Reviewed before it can be approved (current status: ${req_.T27_06_Status || 'Requested'}).` });
     }
-    db.prepare(`UPDATE T27_Requisition SET T27_06_Status = ?, T27_12_Approved_By = ?, T27_13_Approved_Date = ?, T27_08_Notes = COALESCE(?, T27_08_Notes) WHERE T27_Requisition_ID = ?`)
-      .run(decision, user.name, new Date().toISOString().slice(0, 10), notes || null, req.params.id);
+    (await dbRun(`UPDATE T27_Requisition SET T27_06_Status = ?, T27_12_Approved_By = ?, T27_13_Approved_Date = ?, T27_08_Notes = COALESCE(?, T27_08_Notes) WHERE T27_Requisition_ID = ?`, [decision, user.name, new Date().toISOString().slice(0, 10), notes || null, req.params.id]));
     res.json({ ok: true, status: decision });
   } catch (e) {
     res.status(400).json({ error: e.message });
@@ -1210,19 +1214,19 @@ app.post('/api/requisitions/:id/approve', (req, res) => {
 // Full detail bundle for the requisition screen — includes the linked
 // Sales Order's line items (all of them, matching the real SRF form) and
 // the requester/reviewer/approver names.
-app.get('/api/requisitions/:id/full', (req, res) => {
+app.get('/api/requisitions/:id/full', async (req, res) => {
   try {
-    const reqRow = db.prepare(`SELECT * FROM T27_Requisition WHERE T27_Requisition_ID = ?`).get(req.params.id);
+    const reqRow = (await dbGet(`SELECT * FROM T27_Requisition WHERE T27_Requisition_ID = ?`, [req.params.id]));
     if (!reqRow) return res.status(404).json({ error: 'Not found' });
     let soLines = [];
     let so = null;
     if (reqRow.T14_SO_PK) {
-      so = db.prepare(`SELECT * FROM T14_Sales_Orders WHERE T14_SO_PK = ?`).get(reqRow.T14_SO_PK);
-      soLines = db.prepare(`
+      so = (await dbGet(`SELECT * FROM T14_Sales_Orders WHERE T14_SO_PK = ?`, [reqRow.T14_SO_PK]));
+      soLines = (await dbAll(`
         SELECT d.*, i."T11_01_Part_Number" as partNumber, i."T11_03_Short_Description" as itemName
         FROM T15_SO_Details d LEFT JOIN T11_Item_Master i ON i."T11_Item_Master_PK" = d."T11_Item_Master_PK"
         WHERE d."T14_SO_PK" = ?
-      `).all(reqRow.T14_SO_PK);
+      `, [reqRow.T14_SO_PK]));
     }
     res.json({ requisition: reqRow, so, soLines });
   } catch (e) {
@@ -1230,8 +1234,8 @@ app.get('/api/requisitions/:id/full', (req, res) => {
   }
 });
 
-registerReportRoutes(app, db);
-registerReports2(app, db);
+registerReportRoutes(app);
+registerReports2(app);
 
 app.get('*', (req, res) => {
   res.sendFile(path.join(__dirname, 'public', 'index.html'));
@@ -1269,19 +1273,26 @@ function handleListenError(err) {
 httpServer.on('error', handleListenError);
 wss.on('error', handleListenError);
 
-httpServer.listen(PORT, HOST, () => {
-  const actualPort = httpServer.address().port; // resolves the real bound port even when PORT=0 (random)
-  ACTUAL_PORT = actualPort;
-  const nets = require('os').networkInterfaces();
-  const lanAddresses = [];
-  for (const iface of Object.values(nets)) {
-    for (const addr of iface || []) {
-      if (addr.family === 'IPv4' && !addr.internal) lanAddresses.push(addr.address);
+(async () => {
+  await runMigrations();
+
+  httpServer.listen(PORT, HOST, () => {
+    const actualPort = httpServer.address().port; // resolves the real bound port even when PORT=0 (random)
+    ACTUAL_PORT = actualPort;
+    const nets = require('os').networkInterfaces();
+    const lanAddresses = [];
+    for (const iface of Object.values(nets)) {
+      for (const addr of iface || []) {
+        if (addr.family === 'IPv4' && !addr.internal) lanAddresses.push(addr.address);
+      }
     }
-  }
-  console.log(`Nexora app running at http://localhost:${actualPort}`);
-  if (lanAddresses.length) {
-    console.log(`On your network, other machines can reach this at: ${lanAddresses.map(a => `http://${a}:${actualPort}`).join(', ')}`);
-  }
-  if (process.send) process.send({ type: 'ready', port: actualPort });
+    console.log(`Nexora app running at http://localhost:${actualPort}`);
+    if (lanAddresses.length) {
+      console.log(`On your network, other machines can reach this at: ${lanAddresses.map(a => `http://${a}:${actualPort}`).join(', ')}`);
+    }
+    if (process.send) process.send({ type: 'ready', port: actualPort });
+  });
+})().catch(err => {
+  console.error('Fatal error during startup (likely a database migration/connection problem):', err);
+  process.exit(1);
 });
