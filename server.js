@@ -189,13 +189,18 @@ app.use(express.json());
 // rate limiting, no account lockout, no HTTPS enforcement, and the app has
 // no built-in exposure protection if you put it on the open internet.
 // ---------------------------------------------------------------------
-const SESSION_SECRET_PATH = path.join(path.dirname(DB_PATH), '.session-secret');
-let SESSION_SECRET;
-try {
-  SESSION_SECRET = fs.readFileSync(SESSION_SECRET_PATH, 'utf8').trim();
-} catch (e) {
-  SESSION_SECRET = crypto.randomBytes(32).toString('hex');
-  fs.writeFileSync(SESSION_SECRET_PATH, SESSION_SECRET);
+// SESSION_SECRET: on Render (ephemeral disk), set a SESSION_SECRET env var
+// so sessions survive restarts/redeploys. Falls back to a file persisted
+// next to this script for local/desktop use, where the disk is durable.
+let SESSION_SECRET = process.env.SESSION_SECRET;
+if (!SESSION_SECRET) {
+  const SESSION_SECRET_PATH = path.join(__dirname, '.session-secret');
+  try {
+    SESSION_SECRET = fs.readFileSync(SESSION_SECRET_PATH, 'utf8').trim();
+  } catch (e) {
+    SESSION_SECRET = crypto.randomBytes(32).toString('hex');
+    try { fs.writeFileSync(SESSION_SECRET_PATH, SESSION_SECRET); } catch (e2) { /* read-only fs — fine, just won't persist across restarts */ }
+  }
 }
 
 app.use(session({
@@ -412,9 +417,11 @@ app.use((req, res, next) => {
 });
 app.use(express.static(path.join(__dirname, 'public')));
 
-// Uploaded images live next to the database (also works inside the packaged
-// Electron app's userData folder, since that copy overrides DB_PATH).
-const UPLOADS_DIR = path.join(path.dirname(DB_PATH), 'uploads');
+// Uploaded images live next to this script. Note: on Render's free tier
+// (ephemeral disk), uploaded files will NOT survive a redeploy — only the
+// database itself is persisted now (via Turso). If uploads need to survive
+// redeploys too, they'd need to move to something like S3/Cloudinary/Tigris.
+const UPLOADS_DIR = path.join(__dirname, 'uploads');
 if (!fs.existsSync(UPLOADS_DIR)) fs.mkdirSync(UPLOADS_DIR, { recursive: true });
 app.use('/uploads', express.static(UPLOADS_DIR));
 
