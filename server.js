@@ -140,6 +140,23 @@ async function runMigrations() {
   // NULL constraint). Now a requisition links to a whole Sales Order and
   // lists all of its items instead, so that old constraint has to go —
   // SQLite can't relax a NOT NULL in place, so this rebuilds the table.
+
+  // Re-run the additive column migrations above now that every base table
+  // is guaranteed to exist. On a genuinely fresh database, every attempt
+  // above ran before its target table existed and was (correctly) skipped
+  // — without this second pass, those columns would silently never get
+  // added on a fresh install, and the T27_Requisition rebuild just below
+  // would fail trying to copy columns that were never created.
+  for (const m of migrations) {
+    try {
+      const cols = (await dbAll(`PRAGMA table_info("${m.table}")`));
+      const exists = cols.some(c => c.name === m.column);
+      if (!exists) (await dbExec(m.ddl));
+    } catch (e) {
+      console.error(`Migration (second pass) failed for ${m.table}.${m.column}:`, e.message);
+    }
+  }
+
   try {
     const tableInfo = (await dbAll(`PRAGMA table_info("T27_Requisition")`));
     const itemCol = tableInfo.find(c => c.name === 'T11_Item_Master_PK');
