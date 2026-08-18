@@ -20,6 +20,15 @@ let EDITING_ID = null;
 let FK_OPTIONS_CACHE = {};
 
 const $ = sel => document.querySelector(sel);
+
+function togglePasswordVisibility(inputId, btn) {
+  const input = document.getElementById(inputId);
+  if (!input) return;
+  const showing = input.type === 'text';
+  input.type = showing ? 'password' : 'text';
+  btn.textContent = showing ? '👁' : '🙈';
+  btn.setAttribute('aria-label', showing ? 'Show password' : 'Hide password');
+}
 const nav = $('#nav');
 const content = $('#content');
 const entityTitle = $('#entity-title');
@@ -55,9 +64,26 @@ function canSeeEntity(entityKey) {
 }
 
 async function showLoginScreen(errorMsg, mode) {
-  const users = await fetch('/api/auth/login-users').then(r => r.json()).catch(() => []);
-  const noUsersYet = users.length === 0;
+  let users = [];
+  let loadError = null;
+  try {
+    const res = await fetch('/api/auth/login-users');
+    if (!res.ok) {
+      const body = await res.json().catch(() => ({}));
+      loadError = `Could not check for existing accounts (server said: ${body.error || res.status}). This is a backend/database problem, not a "no accounts yet" situation — check the server logs.`;
+    } else {
+      users = await res.json();
+      if (!Array.isArray(users)) {
+        loadError = 'Server returned an unexpected response checking for existing accounts. Check the server logs.';
+        users = [];
+      }
+    }
+  } catch (e) {
+    loadError = `Could not reach the server to check for existing accounts (${e.message}). This usually means the app crashed or the database connection failed — check the server logs, not a real "no accounts yet" situation.`;
+  }
+  const noUsersYet = !loadError && users.length === 0;
   const showSignup = noUsersYet || mode === 'signup';
+  errorMsg = loadError || errorMsg;
 
   document.body.innerHTML = `
     <div class="login-screen">
@@ -71,7 +97,12 @@ async function showLoginScreen(errorMsg, mode) {
           ${errorMsg ? `<div class="login-error">${escapeHtml(errorMsg)}</div>` : ''}
           <div class="field"><label>Full Name</label><input type="text" id="setup_name" /></div>
           <div class="field"><label>Username</label><input type="text" id="setup_username" autocomplete="username" /></div>
-          <div class="field"><label>Password</label><input type="password" id="setup_password" autocomplete="new-password" /></div>
+          <div class="field"><label>Password</label>
+            <div class="password-wrap">
+              <input type="password" id="setup_password" autocomplete="new-password" />
+              <button type="button" class="password-toggle" onclick="togglePasswordVisibility('setup_password', this)" aria-label="Show password">👁</button>
+            </div>
+          </div>
           ${!noUsersYet ? `<div class="field"><label>Requested Department</label>
             <select id="setup_department">
               <option value="CSR">CSR (Customer Service)</option>
@@ -87,7 +118,12 @@ async function showLoginScreen(errorMsg, mode) {
           ${errorMsg ? `<div class="login-error">${escapeHtml(errorMsg)}</div>` : ''}
           <form id="login-form" onsubmit="return false;">
             <div class="field"><label>Username</label><input type="text" id="login_username" autocomplete="username" /></div>
-            <div class="field"><label>Password</label><input type="password" id="login_password" autocomplete="current-password" /></div>
+            <div class="field"><label>Password</label>
+              <div class="password-wrap">
+                <input type="password" id="login_password" autocomplete="current-password" />
+                <button type="button" class="password-toggle" onclick="togglePasswordVisibility('login_password', this)" aria-label="Show password">👁</button>
+              </div>
+            </div>
             <button type="submit" class="btn btn-primary" style="margin-top:8px;width:100%" onclick="doLogin()">Sign in</button>
           </form>
           <div class="login-hint" style="text-align:center;margin-top:14px"><a href="#" onclick="showLoginScreen(null, 'signup'); return false;">Need an account? Sign up</a></div>
@@ -776,7 +812,7 @@ async function openModal(id) {
       } else if (f.name === 'T28_03_Password') {
         // Never show the existing bcrypt hash in the form — leave blank
         // (meaning "keep current password") unless the admin types a new one.
-        inputHtml = `<input type="password" id="f_${f.name}" placeholder="${existing[f.name] ? 'Leave blank to keep current password' : 'Set a password'}" autocomplete="new-password" />`;
+        inputHtml = `<div class="password-wrap"><input type="password" id="f_${f.name}" placeholder="${existing[f.name] ? 'Leave blank to keep current password' : 'Set a password'}" autocomplete="new-password" /><button type="button" class="password-toggle" onclick="togglePasswordVisibility('f_${f.name}', this)" aria-label="Show password">👁</button></div>`;
       } else if (f.type === 'number') {
         inputHtml = `<input type="number" step="1" id="f_${f.name}" value="${existing[f.name] ?? ''}" />`;
       } else if (f.type === 'float') {
