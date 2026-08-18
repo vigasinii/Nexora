@@ -1,19 +1,19 @@
 const { BASE_STYLE, page, escapeHtml, fmtDate, fmtMoney } = require('./reports');
-const { dbGet, dbAll, dbRun, dbExec } = require('./db-turso');
 
-function registerReports2(app) {
+function registerReports2(app, db) {
 
-  async function getYourCompany() {
-    const yc = (await dbGet(`SELECT * FROM "T04_Your_Company" LIMIT 1`));
+  function getYourCompany() {
+    const yc = db.prepare(`SELECT * FROM "T04_Your_Company" LIMIT 1`).get();
     return yc || { T04_01_Your_Company_Name: 'Your Company' };
   }
 
-  function letterhead(yc) {
+  function letterhead() {
+    const yc = getYourCompany();
     return `<div class="letterhead"><div><div class="company-name">${escapeHtml(yc.T04_01_Your_Company_Name || 'Your Company')}</div></div>`;
   }
 
-  function reportHeader(title, subtitle, yc) {
-    return `${letterhead(yc)}<div class="doc-title"><h1>${escapeHtml(title)}</h1>${subtitle ? `<div class="doc-number">${escapeHtml(subtitle)}</div>` : ''}</div></div>`;
+  function reportHeader(title, subtitle) {
+    return `${letterhead()}<div class="doc-title"><h1>${escapeHtml(title)}</h1>${subtitle ? `<div class="doc-number">${escapeHtml(subtitle)}</div>` : ''}</div></div>`;
   }
 
   function footer(count, label) {
@@ -21,14 +21,14 @@ function registerReports2(app) {
   }
 
   // ---------- shared fact builders ----------
-  async function getSalesFacts(dateField) {
-    const rows = (await dbAll(`SELECT * FROM "T14_Sales_Orders" WHERE "${dateField}" IS NOT NULL`));
-    return Promise.all(rows.map(async so => {
-      const lines = (await dbAll(`SELECT * FROM "T15_SO_Details" WHERE "T14_SO_PK" = ?`, [so.T14_SO_PK]));
+  function getSalesFacts(dateField) {
+    const rows = db.prepare(`SELECT * FROM "T14_Sales_Orders" WHERE "${dateField}" IS NOT NULL`).all();
+    return rows.map(so => {
+      const lines = db.prepare(`SELECT * FROM "T15_SO_Details" WHERE "T14_SO_PK" = ?`).all(so.T14_SO_PK);
       const amount = lines.reduce((s, l) => s + (Number(l.T15_01_Quantity) || 0) * (Number(l.T15_02_Price) || 0), 0);
-      const contact = so.T07_PK ? (await dbGet(`SELECT * FROM "T07_Contacts" WHERE "T07_PK" = ?`, [so.T07_PK])) : null;
-      const company = contact && contact.T01_PK ? (await dbGet(`SELECT * FROM "T01_Company" WHERE "T01_PK" = ?`, [contact.T01_PK])) : null;
-      const employee = so.T05_Employee_PK ? (await dbGet(`SELECT * FROM "T05_Employees" WHERE "T05_Employee_PK" = ?`, [so.T05_Employee_PK])) : null;
+      const contact = so.T07_PK ? db.prepare(`SELECT * FROM "T07_Contacts" WHERE "T07_PK" = ?`).get(so.T07_PK) : null;
+      const company = contact && contact.T01_PK ? db.prepare(`SELECT * FROM "T01_Company" WHERE "T01_PK" = ?`).get(contact.T01_PK) : null;
+      const employee = so.T05_Employee_PK ? db.prepare(`SELECT * FROM "T05_Employees" WHERE "T05_Employee_PK" = ?`).get(so.T05_Employee_PK) : null;
       return {
         soNumber: so.T14_01_SO_Number,
         date: so[dateField],
@@ -37,17 +37,17 @@ function registerReports2(app) {
         amount,
         raw: so,
       };
-    }));
+    });
   }
 
-  async function getPurchaseFacts(dateField) {
-    const rows = (await dbAll(`SELECT * FROM "T17_Purchase_Orders" WHERE "${dateField}" IS NOT NULL`));
-    return Promise.all(rows.map(async po => {
-      const lines = (await dbAll(`SELECT * FROM "T18_PO_Details" WHERE "T17_PO_PK" = ?`, [po.T17_PO_PK]));
+  function getPurchaseFacts(dateField) {
+    const rows = db.prepare(`SELECT * FROM "T17_Purchase_Orders" WHERE "${dateField}" IS NOT NULL`).all();
+    return rows.map(po => {
+      const lines = db.prepare(`SELECT * FROM "T18_PO_Details" WHERE "T17_PO_PK" = ?`).all(po.T17_PO_PK);
       const amount = lines.reduce((s, l) => s + (Number(l.T18_01_Quantity) || 0) * (Number(l.T18_02_Price) || 0), 0);
-      const supplier = po.T07_PK ? (await dbGet(`SELECT * FROM "T07_Contacts" WHERE "T07_PK" = ?`, [po.T07_PK])) : null;
-      const company = supplier && supplier.T01_PK ? (await dbGet(`SELECT * FROM "T01_Company" WHERE "T01_PK" = ?`, [supplier.T01_PK])) : null;
-      const employee = po.T05_Employee_PK ? (await dbGet(`SELECT * FROM "T05_Employees" WHERE "T05_Employee_PK" = ?`, [po.T05_Employee_PK])) : null;
+      const supplier = po.T07_PK ? db.prepare(`SELECT * FROM "T07_Contacts" WHERE "T07_PK" = ?`).get(po.T07_PK) : null;
+      const company = supplier && supplier.T01_PK ? db.prepare(`SELECT * FROM "T01_Company" WHERE "T01_PK" = ?`).get(supplier.T01_PK) : null;
+      const employee = po.T05_Employee_PK ? db.prepare(`SELECT * FROM "T05_Employees" WHERE "T05_Employee_PK" = ?`).get(po.T05_Employee_PK) : null;
       return {
         poNumber: po.T17_01_PO_Number,
         date: po[dateField],
@@ -56,7 +56,7 @@ function registerReports2(app) {
         amount,
         raw: po,
       };
-    }));
+    });
   }
 
   function groupKey(fact, groupBy) {
@@ -67,10 +67,9 @@ function registerReports2(app) {
   }
 
   // detail / summary / chart renderer shared by many rpt1xx/2xx reports
-  async function renderAggregate(facts, groupBy, mode, title, docLabel) {
-    const yc = await getYourCompany();
+  function renderAggregate(facts, groupBy, mode, title, docLabel) {
     if (!facts.length) {
-      return page(title, `${reportHeader(title, null, yc)}<p class="empty-notice">No matching records found.</p>`);
+      return page(title, `${reportHeader(title)}<p class="empty-notice">No matching records found.</p>`);
     }
     if (mode === 'detail') {
       const sorted = [...facts].sort((a, b) => (a.date || '').localeCompare(b.date || ''));
@@ -82,7 +81,7 @@ function registerReports2(app) {
         <td class="num">${fmtMoney(f.amount)}</td>
       </tr>`).join('');
       const total = sorted.reduce((s, f) => s + f.amount, 0);
-      return page(title, `${reportHeader(title, null, yc)}
+      return page(title, `${reportHeader(title)}
         <table class="items">
           <thead><tr><th>Date</th><th>Company</th><th>Employee</th><th>${docLabel} #</th><th class="num">Amount</th></tr></thead>
           <tbody>${rowsHtml}</tbody>
@@ -111,7 +110,7 @@ function registerReports2(app) {
             <div style="background:#1a1a1a;height:100%;width:${(v / maxVal * 100).toFixed(1)}%;"></div>
           </div>
         </div>`).join('');
-      return page(title, `${reportHeader(title, null, yc)}
+      return page(title, `${reportHeader(title)}
         <div style="margin-top:20px;">${barsHtml}</div>
         <div class="totals"><table><tr class="grand"><td>Total</td><td>${fmtMoney(grandTotal)}</td></tr></table></div>
         ${footer(entries.length, 'groups')}
@@ -119,7 +118,7 @@ function registerReports2(app) {
     }
     // summary table
     let rowsHtml = entries.map(([k, v]) => `<tr><td>${escapeHtml(k)}</td><td class="num">${fmtMoney(v)}</td><td class="num">${grandTotal ? (v / grandTotal * 100).toFixed(1) : '0.0'}%</td></tr>`).join('');
-    return page(title, `${reportHeader(title, null, yc)}
+    return page(title, `${reportHeader(title)}
       <table class="items">
         <thead><tr><th>${groupBy[0].toUpperCase() + groupBy.slice(1)}</th><th class="num">Total</th><th class="num">% of Total</th></tr></thead>
         <tbody>${rowsHtml}</tbody>
@@ -130,9 +129,9 @@ function registerReports2(app) {
   }
 
   function salesPurchaseRoute(path, kind, dateField, groupBy, mode, title, docLabel) {
-    app.get(path, async (req, res) => {
-      const facts = kind === 'sales' ? await getSalesFacts(dateField) : await getPurchaseFacts(dateField);
-      res.send(await renderAggregate(facts, groupBy, mode, title, docLabel));
+    app.get(path, (req, res) => {
+      const facts = kind === 'sales' ? getSalesFacts(dateField) : getPurchaseFacts(dateField);
+      res.send(renderAggregate(facts, groupBy, mode, title, docLabel));
     });
   }
 
@@ -147,9 +146,9 @@ function registerReports2(app) {
   salesPurchaseRoute('/reports/rpt108', 'sales', 'T14_03_Quote_Date', 'month', 'summary', 'Quote Summary by Month', 'SO');
   salesPurchaseRoute('/reports/rpt109', 'sales', 'T14_03_Quote_Date', 'month', 'chart', 'Quotes by Month', 'SO');
 
-  app.get('/reports/rpt121', async (req, res) => {
-    const facts = (await getSalesFacts('T14_03_Quote_Date')).filter(f => !f.raw.T14_04_Sale_Date && !f.raw.T14_08_Quote_Lost_Date);
-    res.send(await renderAggregate(facts, 'company', 'detail', 'Open Quotes', 'SO'));
+  app.get('/reports/rpt121', (req, res) => {
+    const facts = getSalesFacts('T14_03_Quote_Date').filter(f => !f.raw.T14_04_Sale_Date && !f.raw.T14_08_Quote_Lost_Date);
+    res.send(renderAggregate(facts, 'company', 'detail', 'Open Quotes', 'SO'));
   });
 
   // ===== Sales analytics (rpt201-209) =====
@@ -165,19 +164,19 @@ function registerReports2(app) {
 
   // ===== Forecast (rpt131-132) =====
   // Matches Q18_SO_Report_Forecast: quoted but not yet sold, with a forecast date set
-  async function getForecastFacts() {
-    const rows = (await dbAll(`
+  function getForecastFacts() {
+    const rows = db.prepare(`
       SELECT * FROM "T14_Sales_Orders"
       WHERE "T14_03_Quote_Date" IS NOT NULL
         AND "T14_04_Sale_Date" IS NULL
         AND "T14_09_Forecast_Date" IS NOT NULL
-    `));
+    `).all();
     const facts = [];
-    for (const so of rows) {
-      const lines = (await dbAll(`
+    rows.forEach(so => {
+      const lines = db.prepare(`
         SELECT d.*, i."T11_03_Short_Description" as item_desc
         FROM "T15_SO_Details" d LEFT JOIN "T11_Item_Master" i ON i."T11_Item_Master_PK" = d."T11_Item_Master_PK"
-        WHERE d."T14_SO_PK" = ?`, [so.T14_SO_PK]));
+        WHERE d."T14_SO_PK" = ?`).all(so.T14_SO_PK);
       lines.forEach(l => {
         facts.push({
           date: so.T14_09_Forecast_Date,
@@ -187,71 +186,71 @@ function registerReports2(app) {
           soNumber: so.T14_01_SO_Number,
         });
       });
-    }
+    });
     return facts;
   }
-  app.get('/reports/rpt131', async (req, res) => res.send(await renderAggregate(await getForecastFacts(), 'company', 'detail', 'Forecast Detail by Product', 'SO')));
-  app.get('/reports/rpt132', async (req, res) => res.send(await renderAggregate(await getForecastFacts(), 'company', 'summary', 'Forecast Summary by Product', 'SO')));
+  app.get('/reports/rpt131', (req, res) => res.send(renderAggregate(getForecastFacts(), 'company', 'detail', 'Forecast Detail by Product', 'SO')));
+  app.get('/reports/rpt132', (req, res) => res.send(renderAggregate(getForecastFacts(), 'company', 'summary', 'Forecast Summary by Product', 'SO')));
 
   // ===== Purchase due-date reports (rpt301-302) =====
   // Matches Q21_PO_Report_Dates: not yet received, with a due date set (covers due-soon and overdue)
-  app.get('/reports/rpt301', async (req, res) => {
-    const facts = (await getPurchaseFacts('T17_04_Due_Date')).filter(f => !f.raw.T17_03_Received_Date);
-    res.send(await renderAggregate(facts, 'company', 'detail', 'Purchase Detail Due by Company', 'PO'));
+  app.get('/reports/rpt301', (req, res) => {
+    const facts = getPurchaseFacts('T17_04_Due_Date').filter(f => !f.raw.T17_03_Received_Date);
+    res.send(renderAggregate(facts, 'company', 'detail', 'Purchase Detail Due by Company', 'PO'));
   });
-  app.get('/reports/rpt302', async (req, res) => {
-    const facts = (await getPurchaseFacts('T17_04_Due_Date')).filter(f => !f.raw.T17_03_Received_Date);
-    res.send(await renderAggregate(facts, 'company', 'detail', 'Purchase Detail by Due Date', 'PO'));
+  app.get('/reports/rpt302', (req, res) => {
+    const facts = getPurchaseFacts('T17_04_Due_Date').filter(f => !f.raw.T17_03_Received_Date);
+    res.send(renderAggregate(facts, 'company', 'detail', 'Purchase Detail by Due Date', 'PO'));
   });
   // Matches Q22_SO_Due_Date: not yet despatched, with a despatch-due date set
-  app.get('/reports/rpt303', async (req, res) => {
-    const facts = (await getSalesFacts('T14_14_Despatch_Due_Date')).filter(f => !f.raw.T14_05_Despatch_Date);
-    res.send(await renderAggregate(facts, 'company', 'detail', 'Sales Detail Due for Despatch', 'SO'));
+  app.get('/reports/rpt303', (req, res) => {
+    const facts = getSalesFacts('T14_14_Despatch_Due_Date').filter(f => !f.raw.T14_05_Despatch_Date);
+    res.send(renderAggregate(facts, 'company', 'detail', 'Sales Detail Due for Despatch', 'SO'));
   });
   // Matches Q23_PO_Report_Received_Date: received-date based
-  app.get('/reports/rpt304', async (req, res) => {
-    const facts = await getPurchaseFacts('T17_03_Received_Date');
-    res.send(await renderAggregate(facts, 'company', 'detail', 'Purchase Details by Received Date', 'PO'));
+  app.get('/reports/rpt304', (req, res) => {
+    const facts = getPurchaseFacts('T17_03_Received_Date');
+    res.send(renderAggregate(facts, 'company', 'detail', 'Purchase Details by Received Date', 'PO'));
   });
 
   // ===== Overdue / outstanding / paid (rpt305-308) =====
   // rpt305 matches Q29_Overdue_Paid_Accounts: accounts that WERE paid, but paid after the due date
-  app.get('/reports/rpt305', async (req, res) => {
-    const facts = (await getSalesFacts('T14_13_Payment Received')).filter(f => {
+  app.get('/reports/rpt305', (req, res) => {
+    const facts = getSalesFacts('T14_13_Payment Received').filter(f => {
       const paid = f.raw['T14_13_Payment Received'];
       const due = f.raw.T14_07_Payment_Due_Date;
       return paid && due && String(paid) > String(due);
     });
-    res.send(await renderAggregate(facts, 'company', 'detail', 'Overdue Paid Accounts', 'SO'));
+    res.send(renderAggregate(facts, 'company', 'detail', 'Overdue Paid Accounts', 'SO'));
   });
   // rpt306 matches Q30_Outstanding_Accounts: unpaid AND past due date (not yet paid at all)
-  app.get('/reports/rpt306', async (req, res) => {
+  app.get('/reports/rpt306', (req, res) => {
     const today = new Date().toISOString().slice(0, 10);
-    const facts = (await getSalesFacts('T14_07_Payment_Due_Date')).filter(f =>
+    const facts = getSalesFacts('T14_07_Payment_Due_Date').filter(f =>
       !f.raw['T14_13_Payment Received'] && f.date && String(f.date) < today);
-    res.send(await renderAggregate(facts, 'company', 'detail', 'Outstanding Accounts', 'SO'));
+    res.send(renderAggregate(facts, 'company', 'detail', 'Outstanding Accounts', 'SO'));
   });
-  app.get('/reports/rpt307', async (req, res) => {
-    const facts = await getSalesFacts('T14_06_Invoice_Date');
-    res.send(await renderAggregate(facts, 'month', 'summary', 'Invoice Summary by Month', 'SO'));
+  app.get('/reports/rpt307', (req, res) => {
+    const facts = getSalesFacts('T14_06_Invoice_Date');
+    res.send(renderAggregate(facts, 'month', 'summary', 'Invoice Summary by Month', 'SO'));
   });
-  app.get('/reports/rpt308', async (req, res) => {
-    const facts = await getSalesFacts('T14_13_Payment Received');
-    res.send(await renderAggregate(facts, 'month', 'summary', 'Paid Account Summary', 'SO'));
+  app.get('/reports/rpt308', (req, res) => {
+    const facts = getSalesFacts('T14_13_Payment Received');
+    res.send(renderAggregate(facts, 'month', 'summary', 'Paid Account Summary', 'SO'));
   });
 
   // ===== Balance sheet (rpt309) =====
   // Matches Q63/Q64: cash-basis - sales counted when PAID (Payment_Received), purchases when PAID (Date_Paid)
-  app.get('/reports/rpt309', async (req, res) => {
-    const sales = await getSalesFacts('T14_13_Payment Received');
-    const purchases = await getPurchaseFacts('T17_06_Date_Paid');
+  app.get('/reports/rpt309', (req, res) => {
+    const sales = getSalesFacts('T14_13_Payment Received');
+    const purchases = getPurchaseFacts('T17_06_Date_Paid');
     const months = new Set([...sales.map(f => String(f.date).slice(0, 7)), ...purchases.map(f => String(f.date).slice(0, 7))]);
     const salesByMonth = {}, purchByMonth = {};
     sales.forEach(f => { const m = String(f.date).slice(0, 7); salesByMonth[m] = (salesByMonth[m] || 0) + f.amount; });
     purchases.forEach(f => { const m = String(f.date).slice(0, 7); purchByMonth[m] = (purchByMonth[m] || 0) + f.amount; });
     const sortedMonths = [...months].sort();
     if (!sortedMonths.length) {
-      return res.send(page('Balance Sheet', `${reportHeader('Balance Sheet', null, yc)}<p class="empty-notice">No sales or purchase data yet.</p>`));
+      return res.send(page('Balance Sheet', `${reportHeader('Balance Sheet')}<p class="empty-notice">No sales or purchase data yet.</p>`));
     }
     let rowsHtml = sortedMonths.map(m => {
       const s = salesByMonth[m] || 0, p = purchByMonth[m] || 0;
@@ -259,7 +258,7 @@ function registerReports2(app) {
     }).join('');
     const totalS = sortedMonths.reduce((s, m) => s + (salesByMonth[m] || 0), 0);
     const totalP = sortedMonths.reduce((s, m) => s + (purchByMonth[m] || 0), 0);
-    res.send(page('Balance Sheet', `${reportHeader('Balance Sheet', null, yc)}
+    res.send(page('Balance Sheet', `${reportHeader('Balance Sheet')}
       <table class="items">
         <thead><tr><th>Month</th><th class="num">Sales</th><th class="num">Purchases</th><th class="num">Net</th></tr></thead>
         <tbody>${rowsHtml}</tbody>
@@ -271,21 +270,20 @@ function registerReports2(app) {
 
   // ===== Price lists (rpt012-015) =====
   // Matches Q34_Price_List: non-obsolete items with at least one non-zero price
-  async function itemsSorted(orderCol) {
-    return (await dbAll(`
+  function itemsSorted(orderCol) {
+    return db.prepare(`
       SELECT i.*, c."T12_01_Category" as category_name
       FROM "T11_Item_Master" i LEFT JOIN "T12_Category" c ON c."T12_Category_PK" = i."T12_Category_PK"
       WHERE i."T11_12_Obsolete" = 0
         AND (COALESCE(i."T11_09_List_Price",0) <> 0 OR COALESCE(i."T11_10_Trade_Price",0) <> 0 OR COALESCE(i."T11_11_OEM_Price",0) <> 0)
       ORDER BY ${orderCol}
-    `));
+    `).all();
   }
   app.get('/reports/rpt012', (req, res) => res.redirect('/reports/item-catalog'));
   app.get('/reports/rpt013', (req, res) => res.redirect('/reports/item-catalog'));
-  app.get('/reports/rpt014', async (req, res) => {
-    const yc = await getYourCompany();
-    const items = await itemsSorted('i."T11_03_Short_Description"');
-    if (!items.length) return res.send(page('3-Tier Price List', `${reportHeader('3-Tier Price List', null, yc)}<p class="empty-notice">No items yet.</p>`));
+  app.get('/reports/rpt014', (req, res) => {
+    const items = itemsSorted('i."T11_03_Short_Description"');
+    if (!items.length) return res.send(page('3-Tier Price List', `${reportHeader('3-Tier Price List')}<p class="empty-notice">No items yet.</p>`));
     let rowsHtml = items.map(it => `<tr>
       <td>${escapeHtml(it.T11_01_Part_Number ?? '')}</td>
       <td>${escapeHtml(it.T11_03_Short_Description || '')}</td>
@@ -293,43 +291,41 @@ function registerReports2(app) {
       <td class="num">${fmtMoney(it.T11_10_Trade_Price)}</td>
       <td class="num">${fmtMoney(it.T11_11_OEM_Price)}</td>
     </tr>`).join('');
-    res.send(page('3-Tier Price List', `${reportHeader('3-Tier Price List', null, yc)}
+    res.send(page('3-Tier Price List', `${reportHeader('3-Tier Price List')}
       <table class="items"><thead><tr><th>Item Code</th><th>Description</th><th class="num">List</th><th class="num">Trade</th><th class="num">OEM</th></tr></thead>
       <tbody>${rowsHtml}</tbody></table>${footer(items.length, 'items')}`));
   });
-  app.get('/reports/rpt015', async (req, res) => {
-    const yc = await getYourCompany();
+  app.get('/reports/rpt015', (req, res) => {
     // Matches Q27_Items_for_Report: all non-obsolete items (no price filter)
-    const items = (await dbAll(`
+    const items = db.prepare(`
       SELECT i.*, c."T12_01_Category" as category_name
       FROM "T11_Item_Master" i LEFT JOIN "T12_Category" c ON c."T12_Category_PK" = i."T12_Category_PK"
       WHERE i."T11_12_Obsolete" = 0
       ORDER BY i."T11_01_Part_Number"
-    `));
-    if (!items.length) return res.send(page('All Parts by Item Code', `${reportHeader('All Parts by Item Code', null, yc)}<p class="empty-notice">No items yet.</p>`));
+    `).all();
+    if (!items.length) return res.send(page('All Parts by Item Code', `${reportHeader('All Parts by Item Code')}<p class="empty-notice">No items yet.</p>`));
     let rowsHtml = items.map(it => `<tr>
       <td>${escapeHtml(it.T11_01_Part_Number ?? '')}</td>
       <td>${escapeHtml(it.T11_03_Short_Description || '')}</td>
       <td>${escapeHtml(it.category_name || '')}</td>
       <td class="num">${it.T11_06_Qty_OH ?? 0}</td>
     </tr>`).join('');
-    res.send(page('All Parts by Item Code', `${reportHeader('All Parts by Item Code', null, yc)}
+    res.send(page('All Parts by Item Code', `${reportHeader('All Parts by Item Code')}
       <table class="items"><thead><tr><th>Item Code</th><th>Description</th><th>Category</th><th class="num">Qty OH</th></tr></thead>
       <tbody>${rowsHtml}</tbody></table>${footer(items.length, 'items')}`));
   });
 
   // ===== Phone / contact lists (rpt011, R27, R40) =====
   // ===== Forecast vs Actual variance (Forecast Monitoring) =====
-  app.get('/reports/forecast-variance', async (req, res) => {
-    const yc = await getYourCompany();
-    const forecasts = (await dbAll(`
+  app.get('/reports/forecast-variance', (req, res) => {
+    const forecasts = db.prepare(`
       SELECT f.*, i."T11_01_Part_Number" as partNumber, i."T11_03_Short_Description" as itemDesc,
              c."T01_01_Company_Name" as customerName
       FROM "T26_Forecast" f
       LEFT JOIN "T11_Item_Master" i ON i."T11_Item_Master_PK" = f."T11_Item_Master_PK"
       LEFT JOIN "T01_Company" c ON c."T01_PK" = f."T01_PK"
       ORDER BY f."T26_04_Quarter" DESC, i."T11_01_Part_Number"
-    `));
+    `).all();
 
     const quarterBounds = (q) => {
       const m = /^(\d{4})-Q([1-4])$/i.exec(String(q || '').trim());
@@ -343,20 +339,20 @@ function registerReports2(app) {
     };
 
     if (!forecasts.length) {
-      return res.send(page('Forecast vs Actual', `${reportHeader('Forecast vs Actual', 'Forecast Monitoring', yc)}<p class="empty-notice">No forecasts recorded yet. Add forecasts under Planning → Sales Forecasts.</p>`));
+      return res.send(page('Forecast vs Actual', `${reportHeader('Forecast vs Actual', 'Forecast Monitoring')}<p class="empty-notice">No forecasts recorded yet. Add forecasts under Planning → Sales Forecasts.</p>`));
     }
 
-    const rowsHtml = (await Promise.all(forecasts.map(async (f) => {
+    const rowsHtml = forecasts.map((f) => {
       const [start, end] = quarterBounds(f.T26_04_Quarter);
       let actualQty = 0;
       if (start && end) {
-        const actual = (await dbGet(`
+        const actual = db.prepare(`
           SELECT COALESCE(SUM(sd."T15_01_Quantity"), 0) as qty
           FROM "T15_SO_Details" sd
           JOIN "T14_Sales_Orders" so ON so."T14_SO_PK" = sd."T14_SO_PK"
           WHERE sd."T11_Item_Master_PK" = ?
             AND so."T14_04_Sale_Date" >= ? AND so."T14_04_Sale_Date" <= ?
-        `, [f.T11_Item_Master_PK, start, end]));
+        `).get(f.T11_Item_Master_PK, start, end);
         actualQty = actual.qty || 0;
       }
       const forecastQty = Number(f.T26_01_Forecast_Quantity) || 0;
@@ -373,9 +369,9 @@ function registerReports2(app) {
         <td class="num" ${varClass}>${variance > 0 ? '+' : ''}${variance}</td>
         <td class="num" ${varClass}>${variancePct}</td>
       </tr>`;
-    }))).join('');
+    }).join('');
 
-    res.send(page('Forecast vs Actual', `${reportHeader('Forecast vs Actual', 'Forecast Monitoring — actual sales vs. quarterly forecast, by item', yc)}
+    res.send(page('Forecast vs Actual', `${reportHeader('Forecast vs Actual', 'Forecast Monitoring — actual sales vs. quarterly forecast, by item')}
       <table class="items">
         <thead><tr><th>Quarter</th><th>Item Code</th><th>Item</th><th>Customer/Branch</th><th class="num">Forecast Qty</th><th class="num">Actual Qty</th><th class="num">Variance</th><th class="num">Variance %</th></tr></thead>
         <tbody>${rowsHtml}</tbody>
@@ -383,65 +379,61 @@ function registerReports2(app) {
       ${footer(forecasts.length, 'forecast lines')}`));
   });
 
-  app.get('/reports/rpt011', async (req, res) => {
-    const yc = await getYourCompany();
+  app.get('/reports/rpt011', (req, res) => {
     // Matches Q28_Contacts_for_Phone_List: non-obsolete company AND non-obsolete contact
-    const contacts = (await dbAll(`
+    const contacts = db.prepare(`
       SELECT c.* FROM "T07_Contacts" c
       JOIN "T01_Company" comp ON comp."T01_PK" = c."T01_PK"
       WHERE c."T07_11_Obsolete" = 0 AND comp."T01_14_Obsolete" = 0
       ORDER BY c."T07_02_Surname"
-    `));
-    if (!contacts.length) return res.send(page('Phone List - All', `${reportHeader('Phone List - All Contacts', null, yc)}<p class="empty-notice">No active contacts found.</p>`));
-    let rowsHtml = (await Promise.all(contacts.map(async c => {
-      const comp = c.T01_PK ? (await dbGet(`SELECT * FROM "T01_Company" WHERE "T01_PK" = ?`, [c.T01_PK])) : null;
+    `).all();
+    if (!contacts.length) return res.send(page('Phone List - All', `${reportHeader('Phone List - All Contacts')}<p class="empty-notice">No active contacts found.</p>`));
+    let rowsHtml = contacts.map(c => {
+      const comp = c.T01_PK ? db.prepare(`SELECT * FROM "T01_Company" WHERE "T01_PK" = ?`).get(c.T01_PK) : null;
       return `<tr><td>${escapeHtml([c.T07_01_Forename, c.T07_02_Surname].filter(Boolean).join(' '))}</td><td>${escapeHtml(comp ? comp.T01_01_Company_Name : '')}</td><td>${escapeHtml(c.T07_03_Phone || c.T07_07_Mobile || '')}</td></tr>`;
-    }))).join('');
-    res.send(page('Phone List - All', `${reportHeader('Phone List - All Contacts', null, yc)}
+    }).join('');
+    res.send(page('Phone List - All', `${reportHeader('Phone List - All Contacts')}
       <table class="items"><thead><tr><th>Name</th><th>Company</th><th>Phone</th></tr></thead><tbody>${rowsHtml}</tbody></table>
       ${footer(contacts.length, 'contacts')}`));
   });
 
-  app.get('/reports/R40', async (req, res) => {
-    const yc = await getYourCompany();
+  app.get('/reports/R40', (req, res) => {
     // Matches Q36_Employees_for_Phone_List: non-obsolete employees
-    const employees = (await dbAll(`SELECT * FROM "T05_Employees" WHERE "T05_11_Obsolete" = 0 ORDER BY "T05_02_Surname"`));
-    if (!employees.length) return res.send(page('Internal Phone List', `${reportHeader('Internal Phone List', null, yc)}<p class="empty-notice">No active employees found.</p>`));
+    const employees = db.prepare(`SELECT * FROM "T05_Employees" WHERE "T05_11_Obsolete" = 0 ORDER BY "T05_02_Surname"`).all();
+    if (!employees.length) return res.send(page('Internal Phone List', `${reportHeader('Internal Phone List')}<p class="empty-notice">No active employees found.</p>`));
     let rowsHtml = employees.map(e => `<tr><td>${escapeHtml([e.T05_01_Forename, e.T05_02_Surname].filter(Boolean).join(' '))}</td><td>${escapeHtml(e.T05_12_Title || '')}</td><td>${escapeHtml(e.T05_03_Phone || e.T05_08_Mobile || '')}</td><td>${escapeHtml(e.T05_06_Email || '')}</td></tr>`).join('');
-    res.send(page('Internal Phone List', `${reportHeader('Internal Phone List', null, yc)}
+    res.send(page('Internal Phone List', `${reportHeader('Internal Phone List')}
       <table class="items"><thead><tr><th>Name</th><th>Title</th><th>Phone</th><th>Email</th></tr></thead><tbody>${rowsHtml}</tbody></table>
       ${footer(employees.length, 'employees')}`));
   });
 
-  app.get('/reports/R27/:companyId', async (req, res) => {
-    const yc = await getYourCompany();
-    const company = (await dbGet(`SELECT * FROM "T01_Company" WHERE "T01_PK" = ?`, [req.params.companyId]));
+  app.get('/reports/R27/:companyId', (req, res) => {
+    const company = db.prepare(`SELECT * FROM "T01_Company" WHERE "T01_PK" = ?`).get(req.params.companyId);
     if (!company) return res.status(404).send(page('Not Found', '<p class="empty-notice">Company not found.</p>'));
-    const contacts = (await dbAll(`SELECT * FROM "T07_Contacts" WHERE "T01_PK" = ?`, [req.params.companyId]));
+    const contacts = db.prepare(`SELECT * FROM "T07_Contacts" WHERE "T01_PK" = ?`).all(req.params.companyId);
     let rowsHtml = contacts.map(c => `<tr><td>${escapeHtml([c.T07_01_Forename, c.T07_02_Surname].filter(Boolean).join(' '))}</td><td>${escapeHtml(c.T07_12_Title || '')}</td><td>${escapeHtml(c.T07_03_Phone || c.T07_07_Mobile || '')}</td></tr>`).join('');
-    res.send(page(`Phone List - ${company.T01_01_Company_Name}`, `${reportHeader(`Phone List`, company.T01_01_Company_Name, yc)}
+    res.send(page(`Phone List - ${company.T01_01_Company_Name}`, `${reportHeader(`Phone List`, company.T01_01_Company_Name)}
       <table class="items"><thead><tr><th>Name</th><th>Title</th><th>Phone</th></tr></thead><tbody>${rowsHtml || '<tr><td colspan="3" class="empty-notice">No contacts on file</td></tr>'}</tbody></table>
       ${footer(contacts.length, 'contacts')}`));
   });
 
   // ===== Contact management / history (R25, R41) =====
-  app.get('/reports/R25/:contactId', async (req, res) => {
-    const yc = await getYourCompany();
-    const contact = (await dbGet(`SELECT * FROM "T07_Contacts" WHERE "T07_PK" = ?`, [req.params.contactId]));
+  app.get('/reports/R25/:contactId', (req, res) => {
+    const contact = db.prepare(`SELECT * FROM "T07_Contacts" WHERE "T07_PK" = ?`).get(req.params.contactId);
     if (!contact) return res.status(404).send(page('Not Found', '<p class="empty-notice">Contact not found.</p>'));
-    const notes = (await dbAll(`SELECT * FROM "T08_Contact_Management" WHERE "T07_PK" = ? ORDER BY "T08_01_Date" DESC`, [req.params.contactId]));
+    const notes = db.prepare(`SELECT * FROM "T08_Contact_Management" WHERE "T07_PK" = ? ORDER BY "T08_01_Date" DESC`).all(req.params.contactId);
     const name = [contact.T07_01_Forename, contact.T07_02_Surname].filter(Boolean).join(' ');
     let rowsHtml = notes.map(n => `<tr><td>${escapeHtml(fmtDate(n.T08_01_Date))}</td><td>${escapeHtml(n.T08_02_Contact_Record || '')}</td></tr>`).join('');
-    res.send(page(`Contact History - ${name}`, `${reportHeader('Contact Management Report', name, yc)}
+    res.send(page(`Contact History - ${name}`, `${reportHeader('Contact Management Report', name)}
       <table class="items"><thead><tr><th>Date</th><th>Note</th></tr></thead><tbody>${rowsHtml || '<tr><td colspan="2" class="empty-notice">No notes on file</td></tr>'}</tbody></table>
       ${footer(notes.length, 'notes')}`));
   });
 
   // ===== Letter / Fax templates (R44, R45) =====
-  async function letterFaxTemplate(kind, contact) {
-    const yc = await getYourCompany();
+  function letterFaxTemplate(kind, contact) {
+    const yc = getYourCompany();
     const name = contact ? [contact.T07_01_Forename, contact.T07_02_Surname].filter(Boolean).join(' ') : '';
-    return `${reportHeader(kind === 'fax' ? 'Fax' : 'Letter', null, yc)}
+    return `${reportHeader(kind === 'fax' ? 'Fax' : 'Letter')}
       <div style="margin-top:20px;">
         <p>${new Date().toLocaleDateString()}</p>
         <p>${escapeHtml(name)}${contact && contact.T07_05_Email ? `<br>${escapeHtml(contact.T07_05_Email)}` : ''}</p>
@@ -452,20 +444,19 @@ function registerReports2(app) {
       </div>
       ${footer()}`;
   }
-  app.get('/reports/letter/:contactId', async (req, res) => {
-    const contact = (await dbGet(`SELECT * FROM "T07_Contacts" WHERE "T07_PK" = ?`, [req.params.contactId]));
-    res.send(page('Letter', await letterFaxTemplate('letter', contact)));
+  app.get('/reports/letter/:contactId', (req, res) => {
+    const contact = db.prepare(`SELECT * FROM "T07_Contacts" WHERE "T07_PK" = ?`).get(req.params.contactId);
+    res.send(page('Letter', letterFaxTemplate('letter', contact)));
   });
-  app.get('/reports/fax/:contactId', async (req, res) => {
-    const contact = (await dbGet(`SELECT * FROM "T07_Contacts" WHERE "T07_PK" = ?`, [req.params.contactId]));
-    res.send(page('Fax', await letterFaxTemplate('fax', contact)));
+  app.get('/reports/fax/:contactId', (req, res) => {
+    const contact = db.prepare(`SELECT * FROM "T07_Contacts" WHERE "T07_PK" = ?`).get(req.params.contactId);
+    res.send(page('Fax', letterFaxTemplate('fax', contact)));
   });
 
   // ===== Reports directory (index of all 50 original reports) =====
-  app.get('/reports', async (req, res) => {
-    const yc = await getYourCompany();
-    const companies = (await dbAll(`SELECT "T01_PK", "T01_01_Company_Name" FROM "T01_Company" ORDER BY "T01_01_Company_Name"`));
-    const contacts = (await dbAll(`SELECT "T07_PK", "T07_01_Forename", "T07_02_Surname" FROM "T07_Contacts" ORDER BY "T07_02_Surname"`));
+  app.get('/reports', (req, res) => {
+    const companies = db.prepare(`SELECT "T01_PK", "T01_01_Company_Name" FROM "T01_Company" ORDER BY "T01_01_Company_Name"`).all();
+    const contacts = db.prepare(`SELECT "T07_PK", "T07_01_Forename", "T07_02_Surname" FROM "T07_Contacts" ORDER BY "T07_02_Surname"`).all();
 
     const companyPicker = companies.map(c => `<option value="${c.T01_PK}">${escapeHtml(c.T01_01_Company_Name)}</option>`).join('');
     const contactPicker = contacts.map(c => `<option value="${c.T07_PK}">${escapeHtml([c.T07_01_Forename, c.T07_02_Surname].filter(Boolean).join(' '))}</option>`).join('');
@@ -522,7 +513,7 @@ function registerReports2(app) {
 
     res.send(`<!DOCTYPE html><html><head><meta charset="utf-8"><title>Reports Directory</title>${BASE_STYLE}
       <style>body{max-width:900px;}</style></head><body>
-      ${reportHeader('Reports Directory', `${sections.reduce((n, s) => n + s.links.length, 0)} reports`, yc)}
+      ${reportHeader('Reports Directory', `${sections.reduce((n, s) => n + s.links.length, 0)} reports`)}
       <div style="margin-top:20px; padding:14px 18px; background:#f7f2e8; border-radius:6px; font-size:12.5px; color:#555;">
         Need a per-company phone list, a contact's history, or a letter/fax? Open the relevant record from its section in the app (Companies, Contacts) — each has a Print or history link that leads here with the right record pre-selected.
       </div>
