@@ -17,6 +17,53 @@ const { registerReports2 } = require('./reports2');
 // database files (e.g. an already-installed desktop app) gain new columns
 // without wiping the user's data.
 async function runMigrations() {
+  // The original ~25 business tables (Companies, Contacts, Items, Sales
+  // Orders, etc.) were only ever created once via build_db.js, straight
+  // into the bundled local datahouse.db file — that script was never run
+  // against Turso, so on a fresh Turso database none of them exist yet.
+  // Recreate that same table-creation logic here, schema-driven off
+  // ENTITIES (same field-to-SQL-type mapping build_db.js uses), but with
+  // IF NOT EXISTS so this is safe to run on every boot without ever
+  // touching data in tables that already exist.
+  function sqlTypeFor(t) {
+    switch (t) {
+      case 'number': return 'INTEGER';
+      case 'float': return 'REAL';
+      case 'bool': return 'INTEGER';
+      case 'date': return 'TEXT';
+      default: return 'TEXT';
+    }
+  }
+  for (const [key, ent] of Object.entries(ENTITIES)) {
+    try {
+      const cols = ent.fields.map(f => `"${f.name}" ${sqlTypeFor(f.type)}`);
+      // Sales Order date fields (Enquiry/Quote/Sale/Invoice/Payment
+      // Due/Forecast/"Payment Received") were deliberately removed from
+      // the Sales Order *form* (schema.js fields), but ~15 existing
+      // reports still query these exact columns directly via raw SQL —
+      // so the physical column has to keep existing even though nobody
+      // can edit it through the UI anymore.
+      if (key === 'salesOrders') {
+        cols.push(
+          '"T14_02_Enquiry_Date" TEXT',
+          '"T14_03_Quote_Date" TEXT',
+          '"T14_04_Sale_Date" TEXT',
+          '"T14_06_Invoice_Date" TEXT',
+          '"T14_07_Payment_Due_Date" TEXT',
+          '"T14_09_Forecast_Date" TEXT',
+          '"T14_13_Payment Received" TEXT'
+        );
+      }
+      const pkClause = ent.pk
+        ? `"${ent.pk}" ${sqlTypeFor(ent.pkType)} PRIMARY KEY,`
+        : `"_rowid" INTEGER PRIMARY KEY AUTOINCREMENT,`;
+      const createSQL = `CREATE TABLE IF NOT EXISTS "${ent.table}" (${pkClause} ${cols.join(', ')});`;
+      await dbExec(createSQL);
+    } catch (e) {
+      console.error(`Migration failed creating base table for entity "${key}" (${ent.table}):`, e.message);
+    }
+  }
+
   const migrations = [
     { table: 'T11_Item_Master', column: 'T11_55_Photo', ddl: 'ALTER TABLE T11_Item_Master ADD COLUMN T11_55_Photo TEXT' },
     { table: 'T21_Projects', column: 'T21_02_Project_Code', ddl: 'ALTER TABLE T21_Projects ADD COLUMN T21_02_Project_Code TEXT' },
@@ -161,6 +208,7 @@ async function runMigrations() {
     const tableInfo = (await dbAll(`PRAGMA table_info("T27_Requisition")`));
     const itemCol = tableInfo.find(c => c.name === 'T11_Item_Master_PK');
     if (itemCol && itemCol.notnull) {
+      (await dbExec(`DROP TABLE IF EXISTS T27_Requisition_new;`));
       (await dbExec(`
         CREATE TABLE T27_Requisition_new (
           T27_Requisition_ID INTEGER PRIMARY KEY AUTOINCREMENT,
