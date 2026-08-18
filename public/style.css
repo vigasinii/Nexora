@@ -230,6 +230,15 @@ tbody tr:last-child td { border-bottom: none; }
 .field-checkbox input { width: auto; }
 .field-checkbox label { margin: 0; }
 
+.password-wrap { position: relative; display: flex; }
+.password-wrap input[type=password], .password-wrap input[type=text] { flex: 1; padding-right: 38px; }
+.password-toggle {
+  position: absolute; right: 4px; top: 50%; transform: translateY(-50%);
+  background: none; border: none; cursor: pointer; font-size: 15px;
+  padding: 4px 6px; line-height: 1; color: var(--muted);
+}
+.password-toggle:hover { color: var(--paper); }
+
 .required-star { color: var(--accent); }
 
 /* Item Master detail screen */
