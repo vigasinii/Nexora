@@ -34,6 +34,30 @@ async function runMigrations() {
       default: return 'TEXT';
     }
   }
+  // Same simple CSV parser used by build_db.js (handles quoted fields with
+  // embedded commas), needed below to seed freshly-created empty tables.
+  function parseCSV(text) {
+    const rows = [];
+    let row = [], field = '', inQuotes = false;
+    for (let i = 0; i < text.length; i++) {
+      const c = text[i];
+      if (inQuotes) {
+        if (c === '"') {
+          if (text[i + 1] === '"') { field += '"'; i++; }
+          else inQuotes = false;
+        } else field += c;
+      } else {
+        if (c === '"') inQuotes = true;
+        else if (c === ',') { row.push(field); field = ''; }
+        else if (c === '\n') { row.push(field); rows.push(row); row = []; field = ''; }
+        else if (c === '\r') { /* skip */ }
+        else field += c;
+      }
+    }
+    if (field.length || row.length) { row.push(field); rows.push(row); }
+    return rows.filter(r => r.length > 1 || (r.length === 1 && r[0] !== ''));
+  }
+
   for (const [key, ent] of Object.entries(ENTITIES)) {
     try {
       const cols = ent.fields.map(f => `"${f.name}" ${sqlTypeFor(f.type)}`);
@@ -59,6 +83,47 @@ async function runMigrations() {
         : `"_rowid" INTEGER PRIMARY KEY AUTOINCREMENT,`;
       const createSQL = `CREATE TABLE IF NOT EXISTS "${ent.table}" (${pkClause} ${cols.join(', ')});`;
       await dbExec(createSQL);
+
+      // Same original CSVs build_db.js used to seed the local database —
+      // never loaded into Turso. Only seed a table if it's completely
+      // empty, so this never overwrites or duplicates real data you've
+      // since entered through the app.
+      const countRow = (await dbGet(`SELECT COUNT(*) c FROM "${ent.table}"`));
+      if (countRow && countRow.c === 0) {
+        const csvPath = path.join(__dirname, 'seed_csv', `${ent.table}.csv`);
+        if (fs.existsSync(csvPath)) {
+          const text = fs.readFileSync(csvPath, 'utf8');
+          const rows = parseCSV(text);
+          if (rows.length >= 2) {
+            const header = rows[0];
+            const dataRows = rows.slice(1);
+            const allCols = ent.pk ? [ent.pk, ...ent.fields.map(f => f.name)] : ent.fields.map(f => f.name);
+            const insertCols = allCols.filter(c => header.includes(c));
+            const fieldTypeMap = {};
+            ent.fields.forEach(f => fieldTypeMap[f.name] = f.type);
+            const insertSQL = `INSERT OR IGNORE INTO "${ent.table}" (${insertCols.map(c => `"${c}"`).join(',')}) VALUES (${insertCols.map(() => '?').join(',')})`;
+            let seededRows = 0;
+            for (const r of dataRows) {
+              const rec = {};
+              header.forEach((h, idx) => rec[h] = r[idx]);
+              const values = insertCols.map(c => {
+                let v = rec[c];
+                if (v === undefined || v === '') return null;
+                const t = fieldTypeMap[c];
+                if (t === 'bool') return (v === '1' || v.toLowerCase?.() === 'true') ? 1 : 0;
+                if (t === 'number') return isNaN(parseInt(v)) ? null : parseInt(v);
+                if (t === 'float') return isNaN(parseFloat(v)) ? null : parseFloat(v);
+                return v;
+              });
+              try {
+                await dbRun(insertSQL, values);
+                seededRows++;
+              } catch (e) { /* skip bad row */ }
+            }
+            if (seededRows) console.log(`Seeded ${seededRows} rows into ${ent.table} from ${ent.table}.csv`);
+          }
+        }
+      }
     } catch (e) {
       console.error(`Migration failed creating base table for entity "${key}" (${ent.table}):`, e.message);
     }
